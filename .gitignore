@@ -1,0 +1,7 @@
+.tools/
+third_party/
+build/
+dist/
+__pycache__/
+*.pyc
+profile.out
