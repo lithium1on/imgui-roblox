@@ -28,11 +28,10 @@ Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** librar
 
 ## Quick start
 
-Download `imgui_roblox.luau` from the [latest release](../../releases/latest), put it in your executor's workspace
-folder, then:
+Load the latest release straight from GitHub:
 
 ```lua
-local ImGui = loadstring(readfile("imgui_roblox.luau"))()
+local ImGui = loadstring(game:HttpGet("https://github.com/lithium1on/imgui-roblox/releases/latest/download/imgui_roblox.luau"))()
 ImGui.Init({ Font = "Monospace", FontSize = 14 }) -- DrawingImmediate on Potassium, Drawing elsewhere
 
 local speed = 16
@@ -59,6 +58,8 @@ A complete script: [`examples/potassium_demo.luau`](examples/potassium_demo.luau
 |---|---|---|
 | `imgui_roblox.luau` | 4.6 MB | everything, including `ImGui.ShowDemoWindow()` and the metrics/debug tools |
 | `imgui_roblox_lite.luau` | 3.1 MB | the same without the demo window and debug tools |
+
+For the lite bundle, load `https://github.com/lithium1on/imgui-roblox/releases/latest/download/imgui_roblox_lite.luau` instead.
 
 ## Building from source
 
