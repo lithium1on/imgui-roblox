@@ -50,6 +50,7 @@ end)
 
 More in the wiki: [Getting started](../../wiki/Getting-Started) · [Init options & render modes](../../wiki/Init-Options-and-Render-Modes) ·
 [Luau API guide](../../wiki/Luau-API-Guide) · [Building & internals](../../wiki/Building-and-Internals).
+
 A complete script: [`examples/potassium_demo.luau`](examples/potassium_demo.luau).
 
 ## Downloads
