@@ -4,7 +4,8 @@
     python build.py setup           download Dear ImGui (master and docking), dear_bindings, Emscripten, Spider and Luau
     python build.py                 build every bundle into dist/
     python build.py docking         build some of them: imgui, imgui_debug, docking, docking_debug
-    python build.py test            run the headless tests against every bundle (or: test api_test --only docking)
+    python build.py test            run the headless tests and the examples against every bundle
+    python build.py test examples   only run the scripts in examples/ (or: test api_test --only docking)
     python build.py bench           frame time on a demo scene (--bundle, --rounds, --luau-opt)
     python build.py toolchain       compile a small C program through Emscripten, Spider and Luau
     python build.py clean           delete build/ and dist/
@@ -25,6 +26,7 @@ import datetime
 import io
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -41,6 +43,7 @@ THIRD_PARTY = ROOT / "third_party"
 BUILD = ROOT / "build"
 DIST = ROOT / "dist"
 HARNESS = ROOT / "tests" / "harness"
+EXAMPLES = ROOT / "examples"
 
 IMGUI_VERSION = "1.92.9b"
 DEAR_BINDINGS_VERSION = "0.21"
@@ -83,6 +86,10 @@ COMMON_TESTS = [
 ]
 DEBUG_TESTS = ["help_section_test", "demo_stress_test"]  # need the demo window
 DOCKING_TESTS = ["docking_test"]
+# The line every example loads its bundle with; the test runs the example against that bundle from dist/
+EXAMPLE_LOAD = re.compile(
+    r'loadstring\(game:HttpGet\("https://github\.com/lithium1on/imgui-roblox/releases/latest/download/(\w+)\.luau"\)\)\(\)'
+)
 
 COMMANDS = ("setup", "build", "test", "bench", "toolchain", "clean")
 
@@ -374,20 +381,13 @@ def find_luau(explicit: str | None) -> str:
     raise BuildError("no Luau CLI found: run python build.py setup, or pass --luau PATH")
 
 
-def run_harness(script: Path, bundle: Path, tag: str, luau: str, flags: list[str]) -> tuple[int, str]:
-    """Runs a harness script against a bundle; writes build/test/<name>.run.luau, .out.txt and .html."""
+def run_luau(name: str, source: str, luau: str, flags: list[str]) -> tuple[int, str]:
+    """Runs Luau source with the CLI; writes build/test/<name>.run.luau, .out.txt and a replay .html."""
     sys.path.insert(0, str(HARNESS))
     import make_viewer
 
-    if not bundle.exists():
-        raise BuildError(f"{relative(bundle)} is missing: run python build.py first")
     test_dir = BUILD / "test"
     test_dir.mkdir(parents=True, exist_ok=True)
-    name = script.stem + tag
-    source = (
-        read(HARNESS / "mock_env.luau") + read(HARNESS / "widgets_ui.luau")
-        + "\nImGuiBundle = (function(...)\n" + read(bundle) + "\nend)()\n" + read(script)
-    )
     run_path = test_dir / f"{name}.run.luau"
     run_path.write_text(source, encoding="utf-8", newline="\n")
     try:
@@ -401,23 +401,71 @@ def run_harness(script: Path, bundle: Path, tag: str, luau: str, flags: list[str
     return process.returncode, output
 
 
+def require_bundle(bundle: Path) -> None:
+    if not bundle.exists():
+        raise BuildError(f"{relative(bundle)} is missing: run python build.py first")
+
+
+def run_harness(script: Path, bundle: Path, tag: str, luau: str, flags: list[str]) -> tuple[int, str]:
+    """Runs a tests/harness script against a bundle."""
+    require_bundle(bundle)
+    source = (
+        read(HARNESS / "mock_env.luau") + read(HARNESS / "widgets_ui.luau")
+        + "\nImGuiBundle = (function(...)\n" + read(bundle) + "\nend)()\n" + read(script)
+    )
+    return run_luau(script.stem + tag, source, luau, flags)
+
+
+def run_example(path: Path, bundle_name: str, luau: str) -> tuple[int, str]:
+    """Runs a script from examples/ against its bundle, with stand-ins for Roblox services and executor functions."""
+    bundle = bundle_path(bundle_name)
+    require_bundle(bundle)
+    script = EXAMPLE_LOAD.sub("ImGuiBundle", read(path), count=1)
+    source = (
+        read(HARNESS / "mock_env.luau") + read(HARNESS / "example_env.luau")
+        + "\nImGuiBundle = (function(...)\n" + read(bundle) + "\nend)()\n"
+        + read(HARNESS / "example_prelude.luau") + "\ndo\n" + script + "\nend\n" + read(HARNESS / "example_driver.luau")
+    )
+    return run_luau(f"example_{path.stem}", source, luau, ["-O2"])
+
+
+def report(label: str, test: str, code: int, output: str, started: float) -> bool:
+    lines = output.splitlines()
+    passed = code == 0 and any(line.startswith("RESULT 0 ") for line in lines)
+    print(f"{'ok  ' if passed else 'FAIL'}  {label:<20} {test} ({time.time() - started:.1f} s)", flush=True)
+    if not passed:
+        shown = [line for line in lines if line.startswith("FAIL") or "error" in line.lower()] or lines[-10:]
+        for line in shown[:20]:
+            print(f"      {line[:200]}")
+    return passed
+
+
 def command_test(args) -> int:
     luau = find_luau(args.luau)
+    names = selected_variants(args.only)
     failures = 0
-    for name in selected_variants(args.only):
+    for name in names:
         for test in tests_for(name):
             if args.tests and test not in args.tests:
                 continue
             started = time.time()
             code, output = run_harness(HARNESS / f"{test}.luau", bundle_path(name), f"_{name}", luau, ["-O2"])
-            lines = output.splitlines()
-            passed = code == 0 and any(line.startswith("RESULT 0 ") for line in lines)
-            print(f"{'ok  ' if passed else 'FAIL'}  {name + '.luau':<20} {test} ({time.time() - started:.1f} s)", flush=True)
-            if not passed:
+            failures += not report(f"{name}.luau", test, code, output, started)
+
+    if not args.tests or "examples" in args.tests:
+        for example in sorted(EXAMPLES.glob("*.luau")):
+            started = time.time()
+            match = EXAMPLE_LOAD.search(read(example))
+            label = f"examples/{example.name}"
+            if match is None or match.group(1) not in VARIANTS:
+                print(f"FAIL  {'?':<20} {label} has no loadstring(game:HttpGet(.../releases/latest/download/<bundle>.luau))() line")
                 failures += 1
-                shown = [line for line in lines if line.startswith("FAIL") or "error" in line.lower()] or lines[-10:]
-                for line in shown[:20]:
-                    print(f"      {line[:200]}")
+                continue
+            if match.group(1) not in names:
+                continue
+            code, output = run_example(example, match.group(1), luau)
+            failures += not report(f"{match.group(1)}.luau", label, code, output, started)
+
     print(f"{failures} failure(s)")
     return 1 if failures else 0
 
@@ -485,8 +533,8 @@ def main() -> int:
     build.add_argument("--no-minify", dest="minify", action="store_false", help="keep Spider's names and layout")
     build.add_argument("--no-optimize-directive", dest="optimize_directive", action="store_false", help="leave out --!optimize 2")
     build.add_argument("--date", default=datetime.date.today().isoformat(), help="build date written in the header")
-    test = commands.add_parser("test", help="run the headless tests")
-    test.add_argument("tests", nargs="*", help="only these tests, e.g. api_test")
+    test = commands.add_parser("test", help="run the headless tests and the examples")
+    test.add_argument("tests", nargs="*", help="only these tests, e.g. api_test, or examples for the scripts in examples/")
     test.add_argument("--only", action="append", default=[], help="only this bundle (repeatable)")
     test.add_argument("--luau", help="path to the Luau CLI")
     bench = commands.add_parser("bench", help="measure frame time")

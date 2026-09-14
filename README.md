@@ -9,9 +9,17 @@ Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** librar
 
 </div>
 
-| DrawingImmediate mode | Drawing mode |
+![Dear ImGui's demo window and a simple overlay running in a Roblox game](docs/images/showcase.gif)
+
+## Values
+
+| | |
 |---|---|
-| ![DrawingImmediate mode](docs/images/mode_drawingimmediate.png) | ![Drawing mode](docs/images/mode_drawing.png) |
+| **Compatibility** | Runs on Potassium's DrawingImmediate and on any executor with a Drawing library, detected automatically, with any keyboard layout. |
+| **Stability** | Unmodified Dear ImGui, and every bundle and every example goes through the headless tests before a release. |
+| **Size** | One file per build: 3.1 MB, up to 5.3 MB with docking and the demo window. |
+| **Parity** | Dear ImGui's API from Luau under its C++ names, generated from Dear ImGui's own metadata, docking branch included. |
+| **Optimization** | The translated code is rewritten, minified and compiled at Luau's optimization level 2: frames about 15% faster than before. |
 
 ## Features
 
@@ -54,7 +62,21 @@ end)
 More in the wiki: [Getting started](../../wiki/Getting-Started) · [Init options & render modes](../../wiki/Init-Options-and-Render-Modes) ·
 [Luau API guide](../../wiki/Luau-API-Guide) · [Building & internals](../../wiki/Building-and-Internals).
 
-A complete script: [`examples/potassium_demo.luau`](examples/potassium_demo.luau).
+## Examples
+
+| Script | Shows |
+|---|---|
+| [`hello_world.luau`](examples/hello_world.luau) | the smallest script: one window |
+| [`widgets.luau`](examples/widgets.luau) | buttons, sliders, inputs, combos, lists, trees, tabs and plots |
+| [`custom_theme.luau`](examples/custom_theme.luau) | a fully custom theme with a theme switcher, a title font and one-off style overrides |
+| [`docking_layout.luau`](examples/docking_layout.luau) | panels that dock into each other, with a main menu bar (`docking.luau`) |
+| [`overlay.luau`](examples/overlay.luau) | a click-through stats overlay with a frame time graph, and a crosshair |
+| [`settings_persistence.luau`](examples/settings_persistence.luau) | settings and window layout saved between runs, a close button that shuts everything down |
+| [`player_list.luau`](examples/player_list.luau) | a searchable table of the players in the server with a right-click menu |
+| [`console.luau`](examples/console.luau) | a colored, filterable log with a command line |
+| [`potassium_demo.luau`](examples/potassium_demo.luau) | the demo window next to a panel of widgets and a draw list (`imgui_debug.luau`) |
+
+`python build.py test` runs every example, so they keep working with each release.
 
 ## Downloads
 
