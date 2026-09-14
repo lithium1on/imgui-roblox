@@ -358,3 +358,35 @@ RBX_EXPORT const char* rbx_version(void)    { return IMGUI_VERSION; }
 RBX_EXPORT const char* rbx_save_ini(void)           { return ImGui::SaveIniSettingsToMemory(NULL); }
 RBX_EXPORT void        rbx_load_ini(const char* ini) { ImGui::LoadIniSettingsFromMemory(ini); }
 
+
+//-----------------------------------------------------------------------------
+// Scripts sharing one context (see "Sharing between scripts" in luau/runtime.luau)
+//-----------------------------------------------------------------------------
+// Every script after the first one keeps its own ImGuiStyle. While its frame callbacks run, that style is swapped
+// into the context (so edits made during the callbacks stay with the script) and its font is pushed.
+
+RBX_EXPORT ImGuiStyle* rbx_style_new(void)           { return IM_NEW(ImGuiStyle)(); }
+RBX_EXPORT void        rbx_style_free(ImGuiStyle* s) { IM_DELETE(s); }
+RBX_EXPORT void        rbx_style_swap(ImGuiStyle* s) { ImSwap(ImGui::GetStyle(), *s); }
+
+static ImGuiErrorRecoveryState g_ScriptRecovery;
+
+RBX_EXPORT void rbx_script_begin(ImGuiStyle* style, ImFont* font, double font_size)
+{
+    if (style != NULL)
+        ImSwap(ImGui::GetStyle(), *style);
+    if (font != NULL)
+        ImGui::PushFont(font, (float)font_size);
+    ImGui::ErrorRecoveryStoreState(&g_ScriptRecovery);
+}
+
+// Unwinds whatever the script's callbacks left open (a missing End(), PopStyleColor()...), so it cannot break the
+// windows of the next script, then restores the context style and font.
+RBX_EXPORT void rbx_script_end(ImGuiStyle* style, ImFont* font)
+{
+    ImGui::ErrorRecoveryTryToRecoverState(&g_ScriptRecovery);
+    if (style != NULL)
+        ImSwap(ImGui::GetStyle(), *style);
+    if (font != NULL)
+        ImGui::PopFont();
+}

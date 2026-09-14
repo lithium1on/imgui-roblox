@@ -1,9 +1,9 @@
 -- Dear ImGui for Roblox: runtime
 -- Glue between the Luau translation of Dear ImGui (C++ -> WebAssembly with Emscripten -> Luau with Spider),
 -- the render modes in renderer.luau (DrawingImmediate, Drawing) and UserInputService.
--- The bundle calls this chunk with (WasmInstantiate, InstallBindings, Renderer).
+-- The bundle calls this chunk with (WasmInstantiate, InstallBindings, Renderer, bundle name, has the text editor addon).
 
-local WasmInstantiate, InstallBindings, Renderer = ...
+local WasmInstantiate, InstallBindings, Renderer, BuildName, HasTextEditor = ...
 
 local band, bor, rshift, lshift = bit32.band, bit32.bor, bit32.rshift, bit32.lshift
 local readu8, readu16, readu32, readi32 = buffer.readu8, buffer.readu16, buffer.readu32, buffer.readi32
@@ -22,6 +22,7 @@ end
 
 local ImGui = {}
 ImGui.Version = "1.92.9b"
+local Raw = ImGui -- this bundle's own functions; a script's ImGui table can point at another bundle's
 
 local Api = {} -- shared with the generated bindings
 local Exports = nil -- WebAssembly exports; functions are Spider closures called as closure[1](closure, ...)
@@ -507,6 +508,9 @@ local function BuildImports(options, measureGlyph)
 	env.log_message = Closure(function(_, ptr)
 		print("[ImGui] " .. (ReadCString(Mem(), ptr) or ""))
 	end)
+	env.clock_now = Closure(function()
+		return clock()
+	end)
 
 	local pendingOutput = ""
 	local wasi = MissingImportTable("wasi_snapshot_preview1", 52) -- ENOSYS
@@ -833,7 +837,7 @@ local function CreateUserInput(options)
 			local down = UIS:IsKeyDown(pair[1]) or UIS:IsKeyDown(pair[2])
 			if down ~= modState[i] then
 				modState[i] = down
-				ImGui.AddKeyEvent(ModKeys[i - 1], down)
+				Raw.AddKeyEvent(ModKeys[i - 1], down)
 			end
 		end
 		local count = #events
@@ -842,18 +846,18 @@ local function CreateUserInput(options)
 				local event = events[i]
 				local kind = event[1]
 				if kind == "button" then
-					ImGui.AddMouseButtonEvent(event[2], event[3])
+					Raw.AddMouseButtonEvent(event[2], event[3])
 				elseif kind == "key" then
 					local imguiName = ImGuiKeyFor(event[2])
 					if imguiName then
-						ImGui.AddKeyEvent(imguiName, event[3])
+						Raw.AddKeyEvent(imguiName, event[3])
 					end
 				elseif kind == "char" then
-					ImGui.AddInputCharacter(event[2])
+					Raw.AddInputCharacter(event[2])
 				elseif kind == "wheel" then
-					ImGui.AddMouseWheelEvent(event[2], event[3])
+					Raw.AddMouseWheelEvent(event[2], event[3])
 				elseif kind == "focus" then
-					ImGui.AddFocusEvent(event[2])
+					Raw.AddFocusEvent(event[2])
 					lastX, lastY = nil, nil -- Dear ImGui forgets the mouse position on focus changes: send it again
 				end
 			end
@@ -863,16 +867,16 @@ local function CreateUserInput(options)
 			local text = if pasteText ~= nil and math.abs(pasteTextAt - pasteKeyAt) < 0.25 then pasteText else nil
 			if text ~= nil or clock() - pasteKeyAt > 0.1 then
 				if text ~= nil then
-					ImGui.SetClipboardText(text) -- Dear ImGui pastes from its own clipboard: put the system clipboard in it
+					Raw.SetClipboardText(text) -- Dear ImGui pastes from its own clipboard: put the system clipboard in it
 				end
 				local ctrl = modState[1]
 				if not ctrl then
-					ImGui.AddKeyEvent(ModKeys[0], true)
+					Raw.AddKeyEvent(ModKeys[0], true)
 				end
-				ImGui.AddKeyEvent("V", true)
-				ImGui.AddKeyEvent("V", false)
+				Raw.AddKeyEvent("V", true)
+				Raw.AddKeyEvent("V", false)
 				if not ctrl then
-					ImGui.AddKeyEvent(ModKeys[0], false)
+					Raw.AddKeyEvent(ModKeys[0], false)
 				end
 				pasteKeyAt, pasteText = nil, nil
 			end
@@ -880,13 +884,13 @@ local function CreateUserInput(options)
 		local mouse = UIS:GetMouseLocation()
 		if mouse.X ~= lastX or mouse.Y ~= lastY then
 			lastX, lastY = mouse.X, mouse.Y
-			ImGui.AddMousePosEvent(lastX, lastY)
+			Raw.AddMousePosEvent(lastX, lastY)
 		end
 		if repeatKey then
 			if typing() or not UIS:IsKeyDown(repeatKey) then
 				repeatKey = nil
 			elseif clock() >= repeatAt then
-				ImGui.AddInputCharacter(repeatCodepoint)
+				Raw.AddInputCharacter(repeatCodepoint)
 				repeatAt = clock() + 0.035
 			end
 		end
@@ -978,10 +982,9 @@ end
 -- Public API
 --------------------------------------------------------------------------------
 
-local Initialized = false
-local Options = nil
+local Initialized = false -- this bundle has a Dear ImGui context
+local Options = nil -- the options the context was created with: those of its first script
 local RenderDrawData = nil
-local FrameCallbacks = {}
 local Connections = {}
 local InputPump, InputPost, InputCleanup = nil, nil, nil
 local LastClock = nil
@@ -992,7 +995,15 @@ local Backend, RenderMode = nil, nil
 local FontSlots = {} -- font slot (0-7, stored in glyph texels) -> Drawing font index
 local LastFrameError, LastFrameErrorTime = nil, 0
 local TextMetrics = nil -- checks glyph advances against drawn text (Renderer.CreateGlyphMeasurer)
-local InFrame, ShutdownRequested = false, false -- ImGui.Shutdown() from a frame callback waits for the frame to end
+local InFrame = false -- frame callbacks are running
+local CurrentScript = nil -- the script whose frame callbacks are running
+local Scripts = {} -- scripts drawing with this context, in order; the style of Scripts[1] is the context style
+local ContextStyle = nil -- handle to the context style
+local Group = nil -- the share group whose context this bundle runs
+local Generation = 0 -- counts the contexts this bundle has created
+local Features = nil -- { Docking, Debug } of this bundle, set once the bindings are installed
+
+local ThemeFunctions = { Dark = "StyleColorsDark", Light = "StyleColorsLight", Classic = "StyleColorsClassic" }
 
 local RequiredExports = {
 	"_initialize", "malloc", "free", "emscripten_stack_get_current", "_emscripten_stack_restore",
@@ -1000,7 +1011,17 @@ local RequiredExports = {
 	"rbx_io_mouse_pos", "rbx_io_mouse_button", "rbx_io_mouse_wheel", "rbx_io_key", "rbx_io_char", "rbx_io_focus",
 	"rbx_key_named_begin", "rbx_key_named_end", "rbx_key_name", "rbx_key_mod",
 	"rbx_scratch", "rbx_scratch_size", "rbx_return_slots", "rbx_save_ini", "rbx_load_ini", "rbx_set_clipboard_buffer",
-	"rbx_discard_font_bakes",
+	"rbx_discard_font_bakes", "rbx_style_new", "rbx_style_free", "rbx_style_swap", "rbx_script_begin", "rbx_script_end",
+}
+
+local TE = {} -- text editor addon exports without their "rbx_te_" prefix; empty in bundles built without the addon
+local EditorExports = {
+	"rbx_te_new", "rbx_te_free", "rbx_te_render", "rbx_te_take_changed", "rbx_te_buffer_size", "rbx_te_set_text",
+	"rbx_te_get_text", "rbx_te_get_line_text", "rbx_te_get_cursor_text", "rbx_te_get_language_name", "rbx_te_get_section_text",
+	"rbx_te_replace_section_text", "rbx_te_set_language", "rbx_te_set_palette", "rbx_te_set_palette_color",
+	"rbx_te_get_palette_color", "rbx_te_set_option", "rbx_te_get_option", "rbx_te_command", "rbx_te_query", "rbx_te_line",
+	"rbx_te_region", "rbx_te_cursor", "rbx_te_mouse", "rbx_te_get_word_at_mouse_pos", "rbx_te_find", "rbx_te_string",
+	"rbx_te_add_marker", "rbx_te_add_squiggle",
 }
 
 local function GetDisplaySize()
@@ -1021,8 +1042,6 @@ local function GetDisplaySize()
 	end
 	return 1920, 1080
 end
-
-local ThemeFunctions = { Dark = "StyleColorsDark", Light = "StyleColorsLight", Classic = "StyleColorsClassic" }
 
 local function AllocateFontSlot(font)
 	for slot = 0, 7 do
@@ -1080,8 +1099,10 @@ local function CreateBackend(mode, options)
 	return options.Renderer, nil
 end
 
+local Step -- runs one frame of this bundle's context; defined below
+
 local function SafeStep()
-	local ok, err = pcall(ImGui.Step)
+	local ok, err = pcall(Step)
 	if not ok then
 		local message = tostring(err)
 		local now = clock()
@@ -1106,40 +1127,8 @@ local function StartFrameLoop(mode, options, paintLibrary)
 	Connections[#Connections + 1] = game:GetService("RunService").RenderStepped:Connect(SafeStep)
 end
 
-local function ApplyStyleOptions(options)
-	if options.Theme ~= nil then
-		ImGui[ThemeFunctions[options.Theme]]()
-	end
-	local scale = options.Scale
-	if scale ~= nil and scale ~= 1 then
-		local style = ImGui.GetStyle()
-		style:ScaleAllSizes(scale)
-		style.FontScaleMain = scale
-	end
-	if options.IniSettings ~= nil then
-		ImGui.LoadIniSettings(options.IniSettings)
-	end
-	if ImGui.HasDocking and options.Docking == false then
-		local io = ImGui.GetIO()
-		io.ConfigFlags = band(io.ConfigFlags, bit32.bnot(ImGui.ConfigFlags.DockingEnable))
-	end
-end
-
-function ImGui.Init(options)
-	if Initialized then
-		return ImGui
-	end
-	options = options or {}
-	if type(options) ~= "table" then
-		error("[ImGui] ImGui.Init expects a table of options", 2)
-	end
-	if options.Theme ~= nil and ThemeFunctions[options.Theme] == nil then
-		error('[ImGui] Theme must be "Dark", "Light" or "Classic"', 2)
-	end
-	if options.Docking == true and not ImGui.HasDocking then
-		error("[ImGui] Docking needs a docking build: docking.luau or docking_debug.luau", 2)
-	end
-	local startTime = clock()
+-- Creates this bundle's Dear ImGui context: render mode, input, the default font and docking come from `options`
+local function StartContext(options)
 	local mode = ResolveRenderMode(options)
 	tclear(FontSlots)
 	local baseSlot = AllocateFontSlot(Renderer.ResolveFont(mode, options.Font))
@@ -1157,6 +1146,16 @@ function ImGui.Init(options)
 				error("[ImGui] missing WebAssembly export: " .. name)
 			end
 			F[name] = closure
+		end
+		tclear(TE)
+		if Exports.rbx_te_new ~= nil then
+			for _, name in EditorExports do
+				local closure = Exports[name]
+				if closure == nil then
+					error("[ImGui] missing WebAssembly export: " .. name)
+				end
+				TE[ssub(name, 8)] = closure
+			end
 		end
 
 		F._initialize[1](F._initialize)
@@ -1181,7 +1180,11 @@ function ImGui.Init(options)
 		if Api.OnInit then
 			Api.OnInit()
 		end
-		ApplyStyleOptions(options)
+		ContextStyle = Raw.GetStyle()
+		if Features.Docking and options.Docking == false then
+			local io = Raw.GetIO()
+			io.ConfigFlags = band(io.ConfigFlags, bit32.bnot(Raw.ConfigFlags.DockingEnable))
+		end
 
 		Backend, RenderMode = backend, mode
 		RenderDrawData = Renderer.CreateWalker(backend, measureGlyph, options, textMetrics)
@@ -1201,20 +1204,1013 @@ function ImGui.Init(options)
 			TextMetrics.Destroy()
 			TextMetrics = nil
 		end
-		Backend, RenderMode, RenderDrawData = nil, nil, nil
+		Backend, RenderMode, RenderDrawData, ContextStyle = nil, nil, nil, nil
 		tclear(FontSlots)
 		error(err, 0)
 	end
 
 	Initialized = true
-	ImGui.RenderMode = mode
+	Generation += 1
 	StartFrameLoop(mode, options, paintLibrary)
+end
+
+local Instance -- what other bundles see of this one; defined below
+
+-- Removes every drawing, the frame loop and input, and destroys the context
+local function StopContext()
+	for _, connection in Connections do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	tclear(Connections)
+	if InputCleanup then
+		InputCleanup()
+	end
+	InputPump, InputPost, InputCleanup = nil, nil, nil
+	if Initialized then
+		F.rbx_shutdown[1](F.rbx_shutdown)
+	end
+	if Backend ~= nil and Backend.Destroy ~= nil then
+		pcall(Backend.Destroy)
+	end
+	if TextMetrics ~= nil then
+		TextMetrics.Destroy()
+		TextMetrics = nil
+	end
+	Backend, RenderMode, RenderDrawData, ContextStyle = nil, nil, nil, nil
+	tclear(FontSlots)
+	Initialized = false
+	InFrame, CurrentScript = false, nil
+	for _, script in Scripts do
+		if script.Instance == Instance then
+			script.Instance = nil
+			for editor in script.Editors do
+				editor.__instance = nil -- its memory goes with the context
+			end
+			tclear(script.Editors)
+		end
+	end
+	tclear(Scripts)
+	if Group ~= nil and Group.Host == Instance then
+		Group.Host = nil
+	end
+	Group = nil
+end
+
+--------------------------------------------------------------------------------
+-- Sharing a context between scripts
+--------------------------------------------------------------------------------
+-- Every script loads its own copy of a bundle. Scripts that share (the default) find each other in getgenv(): the
+-- bundle of the first one runs the context and the others add their frame callbacks to it, so there is one frame loop,
+-- one input handler and one set of windows, which stack, take focus and dock like the windows of a single script.
+-- Each script keeps its style and font. The style of the first script is the context style; every other script has an
+-- ImGuiStyle of its own, swapped in around its callbacks by rbx_script_begin/rbx_script_end, which also push its font.
+-- When a script's bundle has everything the running one has and more (docking, the demo window), every script moves
+-- to that bundle: window settings come across as .ini data, styles field by field, and fonts are added again.
+-- Script record: { Table, Options, Callbacks, Fonts, Instance, Shared, Style, FontPtr, FontSize, Leaving }
+
+local SHARE_KEY = "DearImGuiRoblox.Share.1" -- bump the number when Instance or script records change shape
+
+-- The style a script edits: the context style while its callbacks run (or when it's the first script), else its slot.
+-- While another script's callbacks run, the first script's style sits in that script's slot.
+local function StyleHandle(script)
+	local running = CurrentScript
+	if running == script or (script.Style == nil and (running == nil or running.Style == nil)) then
+		return ContextStyle
+	end
+	return Api.Handle("ImGuiStyle", script.Style or running.Style)
+end
+
+-- Style fields by name; colors by ImGuiCol name, since the docking branch has colors the master branch lacks
+local function ReadStyleValues(handle)
+	local values, colors = {}, {}
+	for name, field in Api.ClassFields.ImGuiStyle do
+		if name == "Colors" then
+			local array = handle.Colors
+			for colorName, index in Raw.Col do
+				if index < field[3] then
+					colors[colorName] = array[index]
+				end
+			end
+		elseif field[3] == 0 and field[1] ~= "cstr" and field[1] ~= "ptr" then
+			values[name] = handle[name]
+		end
+	end
+	values.Colors = colors
+	return values
+end
+
+local function WriteStyleValues(handle, values)
+	for name, field in Api.ClassFields.ImGuiStyle do
+		if name == "Colors" then
+			local array = handle.Colors
+			for colorName, color in values.Colors do
+				local index = Raw.Col[colorName]
+				if index ~= nil and index < field[3] then
+					array[index] = color
+				end
+			end
+		elseif values[name] ~= nil and field[3] == 0 and field[1] ~= "cstr" and field[1] ~= "ptr" then
+			handle[name] = values[name]
+		end
+	end
+end
+
+local function AddFontToContext(font, sizePixels, mergeMode)
+	local slot = AllocateFontSlot(Renderer.ResolveFont(RenderMode, font))
+	return (F.rbx_add_font[1](F.rbx_add_font, slot, sizePixels, if mergeMode then 1 else 0))
+end
+
+--------------------------------------------------------------------------------
+-- Text editor addon: ImGuiColorTextEdit (github.com/goossens/ImGuiColorTextEdit, MIT)
+--------------------------------------------------------------------------------
+-- ImGui.TextEditor.new() creates a code editor (syntax highlighting, undo/redo, find/replace, multiple cursors) and
+-- editor:Render(title, size) draws it in the current window. Methods keep TextEditor's names, with zero-based lines and
+-- indexes. An editor belongs to the script that created it: editor:Destroy() or the script's ImGui.Shutdown() frees
+-- it, and when the script moves to another bundle, the editor's text, cursor and settings move along.
+
+local EditorLanguages = { "C", "Cpp", "Cs", "AngelScript", "Lua", "Luau", "Python", "Glsl", "Hlsl", "Json", "Markdown", "Sql" }
+local EditorColors = {
+	"Text", "Keyword", "Declaration", "Number", "String", "Punctuation", "Preprocessor", "Identifier", "KnownIdentifier",
+	"Comment", "Background", "Cursor", "Selection", "Whitespace", "MatchingBracketBackground", "MatchingBracketActive",
+	"MatchingBracketLevel1", "MatchingBracketLevel2", "MatchingBracketLevel3", "MatchingBracketError", "LineNumber",
+	"CurrentLineNumber",
+}
+-- { setter, getter, value is a flag }, in rbx_te_set_option order
+local EditorOptions = {
+	{ "SetTabSize", "GetTabSize" }, { "SetInsertSpacesOnTabs", "IsInsertSpacesOnTabs", true },
+	{ "SetLineSpacing", "GetLineSpacing" }, { "SetWordWrapEnabled", "IsWordWrapEnabled", true },
+	{ "SetReadOnlyEnabled", "IsReadOnlyEnabled", true }, { "SetCaretsVisible", "IsCaretsVisible", true },
+	{ "SetAutoIndentEnabled", "IsAutoIndentEnabled", true }, { "SetShowWhitespacesEnabled", "IsShowWhitespacesEnabled", true },
+	{ "SetShowSpacesEnabled", "IsShowSpacesEnabled", true }, { "SetShowTabsEnabled", "IsShowTabsEnabled", true },
+	{ "SetShowLineNumbersEnabled", "IsShowLineNumbersEnabled", true }, { "SetShowMiniMapEnabled", "IsShowMiniMapEnabled", true },
+	{ "SetMiniMapColumns", "GetMiniMapColumns" }, { "SetShowScrollbarMiniMapEnabled", "IsShowScrollbarMiniMapEnabled", true },
+	{ "SetShowPanScrollIndicatorEnabled", "IsShowPanScrollIndicatorEnabled", true },
+	{ "SetShowMatchingBrackets", "IsShowingMatchingBrackets", true }, { "SetCompletePairedGlyphs", "IsCompletingPairedGlyphs", true },
+	{ "SetLineFoldingEnabled", "IsLineFoldingEnabled", true }, { "SetOverwriteEnabled", "IsOverwriteEnabled", true },
+	{ false, "IsMiddleMousePanMode", true }, { "SetLineNumberLeftMargin", "GetLineNumberLeftMargin" },
+	{ "SetDecorationLeftMargin", "GetDecorationLeftMargin" }, { "SetTextLeftMargin", "GetTextLeftMargin" },
+}
+-- In rbx_te_command order
+local EditorCommands = {
+	"Cut", "Copy", "Paste", "Undo", "Redo", "SelectAll", "ClearCursors", "SetFocus", "ClearText", "OpenFindReplaceWindow",
+	"CloseFindReplaceWindow", "FindNext", "FindAll", "ClearMarkers", "ClearSquiggles", "GrowSelections", "ShrinkSelections",
+	"IndentLines", "DeindentLines", "MoveUpLines", "MoveDownLines", "ToggleComments", "SelectionToLowerCase",
+	"SelectionToUpperCase", "StripTrailingWhitespaces", "TabsToSpaces", "SpacesToTabs", "UnfoldAll",
+}
+-- { name, result is a flag }, in rbx_te_query order
+local EditorQueries = {
+	{ "CanUndo", true }, { "CanRedo", true }, { "GetUndoIndex" }, { "IsEmpty", true }, { "GetLineCount" },
+	{ "GetNumberOfCursors" }, { "AnyCursorHasSelection", true }, { "AllCursorsHaveSelection", true },
+	{ "MainCursorHasSelection", true }, { "CurrentCursorHasSelection", true }, { "HasMarkers", true },
+	{ "HasSquiggles", true }, { "HasFindString", true }, { "GetFirstVisibleRow" }, { "GetLastVisibleRow" },
+	{ "GetFirstVisibleColumn" }, { "GetLastVisibleColumn" }, { "GetLineHeight" }, { "GetGlyphWidth" }, { "HasLanguage", true },
+}
+local EditorColorIndex = {}
+for index, name in EditorColors do
+	EditorColorIndex[name] = index - 1
+end
+local ScrollAlignments = { Top = 0, Middle = 1, Bottom = 2 }
+
+local EditorMethods = {}
+local EditorMeta = {
+	__index = EditorMethods,
+	__tostring = function(self)
+		return sformat("TextEditor: 0x%08x", self.__ptr)
+	end,
+}
+
+local function EditorCall(name, ...)
+	local closure = TE[name]
+	return closure[1](closure, ...)
+end
+
+local function EditorAlive(editor)
+	return editor.__instance == Instance and editor.__generation == Generation and Initialized
+end
+
+local function EditorPtr(editor)
+	if not EditorAlive(editor) then
+		error("[ImGui] this TextEditor was destroyed, by editor:Destroy() or by ImGui.Shutdown()", 3)
+	end
+	return editor.__ptr
+end
+
+-- Calls fn(pointer, size) with `text` copied into linear memory, NUL-terminated
+local function WithText(text, fn)
+	text = if text == nil then "" else tostring(text)
+	local size = #text
+	local ptr = (F.malloc[1](F.malloc, size + 1))
+	local mem = Mem()
+	writestring(mem, ptr, text)
+	writeu8(mem, ptr + size, 0)
+	local result = fn(ptr, size)
+	F.free[1](F.free, ptr)
+	return result
+end
+
+local function EditorString(ptr, resultPtr)
+	return readstring(Mem(), resultPtr, (EditorCall("buffer_size", ptr)))
+end
+
+local function EditorPositions(resultPtr)
+	local mem = Mem()
+	return readi32(mem, resultPtr), readi32(mem, resultPtr + 4), readi32(mem, resultPtr + 8), readi32(mem, resultPtr + 12)
+end
+
+-- An ImU32 (ImGui.COL32), or a Color3 with an optional alpha
+local function ColorU32(color, alpha)
+	if color == nil then
+		return 0
+	elseif type(color) == "number" then
+		return color % 4294967296
+	end
+	local a = if alpha == nil then 1 else alpha
+	return Raw.COL32(floor(color.R * 255 + 0.5), floor(color.G * 255 + 0.5), floor(color.B * 255 + 0.5), floor(a * 255 + 0.5))
+end
+
+local function CreateEditor(script)
+	if TE.new == nil then
+		error("[ImGui] ImGui.TextEditor needs a bundle with the text editor: imgui_editor.luau, docking_editor.luau or a _debug build", 4)
+	end
+	local editor = setmetatable({
+		__ptr = (EditorCall("new")), __instance = Instance, __generation = Generation, __script = script,
+		__settings = { Options = {}, Colors = {}, Labels = {} },
+	}, EditorMeta)
+	script.Editors[editor] = true
+	return editor
+end
+
+local function DestroyEditor(editor)
+	if EditorAlive(editor) then
+		EditorCall("free", editor.__ptr)
+	end
+	editor.__instance = nil
+	if editor.__script ~= nil then
+		editor.__script.Editors[editor] = nil
+	end
+end
+
+local function SnapshotEditor(editor)
+	if not EditorAlive(editor) then
+		return false
+	end
+	local ptr = editor.__ptr
+	local line, index = EditorPositions((EditorCall("cursor", ptr, 1, 0)))
+	return { Text = EditorString(ptr, (EditorCall("get_text", ptr))), Line = line, Index = index }
+end
+
+-- Recreates an editor of another bundle in this bundle's context, with its settings, text and cursor
+local function RestoreEditor(editor, snapshot)
+	if not snapshot or TE.new == nil then
+		editor.__instance = nil
+		return
+	end
+	local ptr = (EditorCall("new"))
+	editor.__ptr, editor.__instance, editor.__generation = ptr, Instance, Generation
+	setmetatable(editor, EditorMeta)
+	local settings = editor.__settings
+	if settings.Language ~= nil then
+		EditorCall("set_language", ptr, settings.Language)
+	end
+	if settings.Palette ~= nil then
+		EditorCall("set_palette", ptr, if settings.Palette == "Light" then 1 else 0)
+	end
+	for index, color in settings.Colors do
+		EditorCall("set_palette_color", ptr, index, color)
+	end
+	for id, value in settings.Options do
+		EditorCall("set_option", ptr, id, value)
+	end
+	for op, text in settings.Labels do
+		WithText(text, function(textPtr, size)
+			EditorCall("string", ptr, op, textPtr, size)
+		end)
+	end
+	WithText(snapshot.Text, function(textPtr, size)
+		EditorCall("set_text", ptr, textPtr, size)
+	end)
+	EditorCall("region", ptr, 0, snapshot.Line, snapshot.Index, 0, 0)
+end
+
+function EditorMethods.Destroy(self)
+	DestroyEditor(self)
+end
+
+function EditorMethods.IsValid(self)
+	return EditorAlive(self)
+end
+
+-- size: Vector2, zero or missing components fill the window. Returns whether the editor has keyboard focus.
+function EditorMethods.Render(self, title, size, childFlags, windowFlags)
+	local ptr = EditorPtr(self)
+	local width, height = 0, 0
+	if size ~= nil then
+		width, height = size.X, size.Y
+	end
+	return WithText(title, function(titlePtr)
+		return EditorCall("render", ptr, titlePtr, width, height, childFlags or 0, windowFlags or -1) ~= 0
+	end)
+end
+
+-- True once after the text changed (typing, undo, SetText...); the change is seen by Render
+function EditorMethods.IsTextChanged(self)
+	return EditorCall("take_changed", EditorPtr(self)) ~= 0
+end
+
+function EditorMethods.SetText(self, text)
+	local ptr = EditorPtr(self)
+	WithText(text, function(textPtr, size)
+		EditorCall("set_text", ptr, textPtr, size)
+	end)
+end
+
+function EditorMethods.GetText(self)
+	local ptr = EditorPtr(self)
+	return EditorString(ptr, (EditorCall("get_text", ptr)))
+end
+
+function EditorMethods.GetLineText(self, line)
+	local ptr = EditorPtr(self)
+	return EditorString(ptr, (EditorCall("get_line_text", ptr, line)))
+end
+
+function EditorMethods.GetCursorText(self, cursor)
+	local ptr = EditorPtr(self)
+	return EditorString(ptr, (EditorCall("get_cursor_text", ptr, cursor or 0)))
+end
+
+function EditorMethods.GetSectionText(self, startLine, startIndex, endLine, endIndex)
+	local ptr = EditorPtr(self)
+	return EditorString(ptr, (EditorCall("get_section_text", ptr, startLine, startIndex, endLine, endIndex)))
+end
+
+function EditorMethods.ReplaceSectionText(self, startLine, startIndex, endLine, endIndex, text)
+	local ptr = EditorPtr(self)
+	WithText(text, function(textPtr, size)
+		EditorCall("replace_section_text", ptr, startLine, startIndex, endLine, endIndex, textPtr, size)
+	end)
+end
+
+-- name: one of ImGui.TextEditor.Languages, or nil for plain text
+function EditorMethods.SetLanguage(self, name)
+	local ptr = EditorPtr(self)
+	local id = if name == nil or name == "None" then 0 else table.find(EditorLanguages, name)
+	if id == nil then
+		error(sformat('[ImGui] unknown TextEditor language "%s" (expected None, %s)', tostring(name), tconcat(EditorLanguages, ", ")), 2)
+	end
+	self.__settings.Language = id
+	EditorCall("set_language", ptr, id)
+end
+
+function EditorMethods.GetLanguageName(self)
+	local ptr = EditorPtr(self)
+	return EditorString(ptr, (EditorCall("get_language_name", ptr)))
+end
+
+-- "Dark" (the default) or "Light"; resets colors set with SetPaletteColor
+function EditorMethods.SetPalette(self, name)
+	local ptr = EditorPtr(self)
+	if name ~= "Dark" and name ~= "Light" then
+		error('[ImGui] TextEditor palettes are "Dark" and "Light"', 2)
+	end
+	self.__settings.Palette = name
+	tclear(self.__settings.Colors)
+	EditorCall("set_palette", ptr, if name == "Light" then 1 else 0)
+end
+
+local function PaletteIndex(color)
+	local index = if type(color) == "number" then color else EditorColorIndex[color]
+	if index == nil or index < 0 or index >= #EditorColors then
+		error(sformat('[ImGui] unknown TextEditor palette color "%s" (see ImGui.TextEditor.Colors)', tostring(color)), 3)
+	end
+	return index
+end
+
+-- color: a name from ImGui.TextEditor.Colors; value: an ImU32 (ImGui.COL32) or a Color3 with an optional alpha
+function EditorMethods.SetPaletteColor(self, color, value, alpha)
+	local ptr = EditorPtr(self)
+	local index, u32 = PaletteIndex(color), ColorU32(value, alpha)
+	self.__settings.Colors[index] = u32
+	EditorCall("set_palette_color", ptr, index, u32)
+end
+
+function EditorMethods.GetPaletteColor(self, color)
+	return (EditorCall("get_palette_color", EditorPtr(self), PaletteIndex(color))) % 4294967296
+end
+
+for index, option in EditorOptions do
+	local id, setter, getter, flag = index - 1, option[1], option[2], option[3]
+	if setter then
+		EditorMethods[setter] = function(self, value)
+			local ptr = EditorPtr(self)
+			local number = if flag then (if value then 1 else 0) else tonumber(value) or 0
+			self.__settings.Options[id] = number
+			EditorCall("set_option", ptr, id, number)
+		end
+	end
+	EditorMethods[getter] = function(self)
+		local value = EditorCall("get_option", EditorPtr(self), id)
+		if flag then
+			return value ~= 0
+		end
+		return value
+	end
+end
+
+for value, name in { [0] = "SetMiddleMouseScrollMode", [1] = "SetMiddleMousePanMode" } do
+	EditorMethods[name] = function(self)
+		local ptr = EditorPtr(self)
+		self.__settings.Options[19] = value
+		EditorCall("set_option", ptr, 19, value)
+	end
+end
+
+for index, name in EditorCommands do
+	local id = index - 1
+	EditorMethods[name] = function(self)
+		EditorCall("command", EditorPtr(self), id)
+	end
+end
+
+for index, query in EditorQueries do
+	local id, name, flag = index - 1, query[1], query[2]
+	EditorMethods[name] = function(self)
+		local value = EditorCall("query", EditorPtr(self), id)
+		if flag then
+			return value ~= 0
+		end
+		return value
+	end
+end
+
+function EditorMethods.SelectLine(self, line)
+	EditorCall("line", EditorPtr(self), 0, line, 0)
+end
+
+function EditorMethods.SelectLines(self, startLine, endLine)
+	EditorCall("line", EditorPtr(self), 1, startLine, endLine)
+end
+
+-- alignment: "Top", "Middle" (the default) or "Bottom"
+function EditorMethods.ScrollToLine(self, line, alignment)
+	EditorCall("line", EditorPtr(self), 2, line, ScrollAlignments[alignment or "Middle"] or 1)
+end
+
+for op, name in { [3] = "FoldAroundLine", [4] = "UnfoldAroundLine", [5] = "ToggleAtLine" } do
+	EditorMethods[name] = function(self, line)
+		EditorCall("line", EditorPtr(self), op, line, 0)
+	end
+end
+
+for op, name in { [6] = "IsLineFoldable", [7] = "IsLineFolded", [8] = "IsLineVisible", [9] = "IsLineHidden" } do
+	EditorMethods[name] = function(self, line)
+		return EditorCall("line", EditorPtr(self), op, line, 0) ~= 0
+	end
+end
+
+function EditorMethods.SelectToBrackets(self, includeBrackets)
+	EditorCall("line", EditorPtr(self), 10, 0, if includeBrackets == false then 0 else 1)
+end
+
+function EditorMethods.AddNextOccurrence(self, wholeWord)
+	EditorCall("line", EditorPtr(self), 11, 0, if wholeWord then 1 else 0)
+end
+
+function EditorMethods.SelectAllOccurrences(self, wholeWord)
+	EditorCall("line", EditorPtr(self), 12, 0, if wholeWord then 1 else 0)
+end
+
+function EditorMethods.SetCursor(self, line, index)
+	EditorCall("region", EditorPtr(self), 0, line, index, 0, 0)
+end
+
+function EditorMethods.SelectRegion(self, startLine, startIndex, endLine, endIndex)
+	EditorCall("region", EditorPtr(self), 1, startLine, startIndex, endLine, endIndex)
+end
+
+-- Without arguments, removes every squiggle
+function EditorMethods.ClearSquiggles(self, startLine, startIndex, endLine, endIndex)
+	local ptr = EditorPtr(self)
+	if startLine == nil then
+		EditorCall("command", ptr, 14)
+	else
+		EditorCall("region", ptr, 2, startLine, startIndex, endLine, endIndex)
+	end
+end
+
+-- Return line, index
+for which, name in { [0] = "GetCursorPosition", [1] = "GetMainCursorPosition", [2] = "GetCurrentCursorPosition" } do
+	EditorMethods[name] = function(self, cursor)
+		local line, index = EditorPositions((EditorCall("cursor", EditorPtr(self), which, cursor or 0)))
+		return line, index
+	end
+end
+
+-- Return startLine, startIndex, endLine, endIndex
+for which, name in { [3] = "GetCursorSelection", [4] = "GetMainCursorSelection", [5] = "GetCurrentCursorSelection" } do
+	EditorMethods[name] = function(self, cursor)
+		return EditorPositions((EditorCall("cursor", EditorPtr(self), which, cursor or 0)))
+	end
+end
+
+function EditorMethods.IsMousePosOverGlyph(self, pos)
+	return EditorCall("mouse", EditorPtr(self), 0, pos.X, pos.Y) ~= 0
+end
+
+function EditorMethods.IsMousePosOverTextArea(self, pos)
+	return EditorCall("mouse", EditorPtr(self), 1, pos.X, pos.Y) ~= 0
+end
+
+function EditorMethods.GetDocPosAtMousePos(self, pos)
+	local line, index = EditorPositions((EditorCall("mouse", EditorPtr(self), 2, pos.X, pos.Y)))
+	return line, index
+end
+
+function EditorMethods.GetWordAtMousePos(self, pos)
+	local ptr = EditorPtr(self)
+	return EditorString(ptr, (EditorCall("get_word_at_mouse_pos", ptr, pos.X, pos.Y)))
+end
+
+-- (text, caseSensitive = true, wholeWord = false)
+for op, name in { [0] = "SelectFirstOccurrenceOf", [1] = "SelectNextOccurrenceOf", [2] = "SelectAllOccurrencesOf" } do
+	EditorMethods[name] = function(self, text, caseSensitive, wholeWord)
+		local ptr = EditorPtr(self)
+		WithText(text, function(textPtr, size)
+			EditorCall("find", ptr, op, textPtr, size, if caseSensitive == false then 0 else 1, if wholeWord then 1 else 0)
+		end)
+	end
+end
+
+for op, name in {
+	[0] = "ReplaceTextInCurrentCursor", [1] = "ReplaceTextInAllCursors", [2] = "SetFindButtonLabel",
+	[3] = "SetFindAllButtonLabel", [4] = "SetReplaceButtonLabel", [5] = "SetReplaceAllButtonLabel",
+} do
+	EditorMethods[name] = function(self, text)
+		local ptr = EditorPtr(self)
+		if op >= 2 then
+			self.__settings.Labels[op] = tostring(text)
+		end
+		WithText(text, function(textPtr, size)
+			EditorCall("string", ptr, op, textPtr, size)
+		end)
+	end
+end
+
+function EditorMethods.AddMarker(self, line, lineNumberColor, textColor, lineNumberTooltip, textTooltip)
+	local ptr = EditorPtr(self)
+	local numberColor, lineColor = ColorU32(lineNumberColor), ColorU32(textColor)
+	WithText(lineNumberTooltip, function(numberPtr, numberSize)
+		WithText(textTooltip, function(textPtr, textSize)
+			EditorCall("add_marker", ptr, line, numberColor, lineColor, numberPtr, numberSize, textPtr, textSize)
+		end)
+	end)
+end
+
+function EditorMethods.AddSquiggle(self, startLine, startIndex, endLine, endIndex, kind, color, tooltip)
+	local ptr = EditorPtr(self)
+	local u32 = ColorU32(color)
+	WithText(tooltip, function(textPtr, size)
+		EditorCall("add_squiggle", ptr, startLine, startIndex, endLine, endIndex, kind or 0, u32, textPtr, size)
+	end)
+end
+
+local function RunScript(script, stackPointer)
+	local style, font = script.Style or 0, script.FontPtr or 0
+	CurrentScript = script
+	F.rbx_script_begin[1](F.rbx_script_begin, style, font, script.FontSize or 0)
+	for _, callback in table.clone(script.Callbacks) do
+		local ok, err = pcall(callback, script.Table)
+		if not ok then
+			warn("[ImGui] frame callback error: " .. tostring(err))
+			F._emscripten_stack_restore[1](F._emscripten_stack_restore, stackPointer)
+		end
+		if script.Leaving then
+			break
+		end
+	end
+	F.rbx_script_end[1](F.rbx_script_end, style, font)
+	CurrentScript = nil
+end
+
+local function RemoveScript(script)
+	local index = table.find(Scripts, script)
+	script.Leaving = nil
+	if script.Instance == Instance then
+		script.Instance = nil
+		for editor in table.clone(script.Editors) do
+			DestroyEditor(editor)
+		end
+	end
+	if index == nil then
+		return
+	end
+	table.remove(Scripts, index)
+	if script.Style ~= nil then
+		F.rbx_style_free[1](F.rbx_style_free, script.Style)
+		script.Style = nil
+	elseif index == 1 then
+		local base = Scripts[1]
+		if base ~= nil and base.Style ~= nil then
+			-- The next script becomes the first one: its style moves into the context
+			F.rbx_style_swap[1](F.rbx_style_swap, base.Style)
+			F.rbx_style_free[1](F.rbx_style_free, base.Style)
+			base.Style = nil
+		end
+	end
+end
+
+Instance = { Protocol = 1, Version = ImGui.Version }
+
+function Instance.Alive()
+	return Initialized
+end
+
+function Instance.InFrame()
+	return InFrame
+end
+
+function Instance.Api()
+	return Raw
+end
+
+function Instance.RenderMode()
+	return RenderMode
+end
+
+function Instance.Generation()
+	return Generation
+end
+
+function Instance.ScriptCount()
+	return #Scripts
+end
+
+function Instance.Scripts()
+	return table.clone(Scripts)
+end
+
+function Instance.StyleHandle(script)
+	return StyleHandle(script)
+end
+
+function Instance.ReadStyle(script)
+	return ReadStyleValues(StyleHandle(script))
+end
+
+function Instance.SaveIni()
+	return Raw.SaveIniSettings()
+end
+
+function Instance.AddFont(font, sizePixels, mergeMode)
+	return AddFontToContext(font, sizePixels, mergeMode)
+end
+
+function Instance.Stop()
+	StopContext()
+end
+
+function Instance.NewEditor(script)
+	return CreateEditor(script)
+end
+
+function Instance.SnapshotEditors(script)
+	local snapshots = {}
+	for editor in script.Editors do
+		snapshots[editor] = SnapshotEditor(editor)
+	end
+	return snapshots
+end
+
+function Instance.RestoreEditors(script, snapshots)
+	for editor, snapshot in snapshots do
+		RestoreEditor(editor, snapshot)
+		if editor.__instance == nil then
+			script.Editors[editor] = nil
+		end
+	end
+end
+
+-- Adds a script. `restore`: style values read from another bundle, used instead of the script's Theme and Scale.
+function Instance.Attach(script, restore)
+	local options = script.Options
+	script.Instance = Instance
+	if #Scripts > 0 then
+		script.Style = (F.rbx_style_new[1](F.rbx_style_new))
+		script.FontSize = options.FontSize or 13
+		script.FontPtr = AddFontToContext(options.Font, script.FontSize, false)
+	else
+		script.Style, script.FontPtr, script.FontSize = nil, nil, nil -- the context was created with its font
+	end
+	table.insert(Scripts, script)
+
+	local style = StyleHandle(script)
+	if restore ~= nil then
+		WriteStyleValues(style, restore)
+	else
+		if options.Theme ~= nil then
+			Raw[ThemeFunctions[options.Theme]](style)
+		end
+		local scale = options.Scale
+		if scale ~= nil and scale ~= 1 then
+			style:ScaleAllSizes(scale)
+			style.FontScaleMain = scale
+		end
+		if options.IniSettings ~= nil then
+			Raw.LoadIniSettings(options.IniSettings)
+		end
+	end
+	for _, token in script.Fonts do
+		token.__ptr = AddFontToContext(token.Font, token.Size, token.Merge)
+	end
+end
+
+-- Removes a script now, or once the frame callbacks have returned when called from one of them
+function Instance.Detach(script)
+	if InFrame then
+		script.Leaving = true
+		return
+	end
+	RemoveScript(script)
+	if #Scripts == 0 then
+		StopContext()
+	end
+end
+
+local function ShareGroup()
+	local ok, env = pcall(function()
+		return if type(getgenv) == "function" then getgenv() elseif type(shared) == "table" then shared else nil
+	end)
+	if not ok or type(env) ~= "table" then
+		return nil
+	end
+	local registry = rawget(env, SHARE_KEY)
+	if type(registry) ~= "table" then
+		registry = {}
+		rawset(env, SHARE_KEY, registry)
+	end
+	local group = registry[Instance.Version]
+	if group == nil then
+		group = {}
+		registry[Instance.Version] = group
+	end
+	return group
+end
+
+local function Covers(features, needed)
+	return (features.Docking or not needed.Docking) and (features.Debug or not needed.Debug)
+		and (features.TextEditor or not needed.TextEditor)
+end
+
+-- This script's record, and the ImGui functions that belong to the script rather than to the context it draws with
+local Script = { Table = ImGui, Callbacks = {}, Fonts = {}, Editors = {}, Instance = nil, Shared = false }
+local ScriptFunctions = {}
+local WarnedSeparate = false
+
+-- Points a script's ImGui table at the functions of the bundle running its context
+local function BindScript(script, instance)
+	local target = script.Table
+	for key, value in instance.Api() do
+		if ScriptFunctions[key] == nil then
+			target[key] = value
+		end
+	end
+	target.RenderMode = instance.RenderMode()
+	target.HasDocking = instance.Features.Docking
+	target.HasTextEditor = instance.Features.TextEditor
+	target.Build = instance.Build
+end
+
+-- Moves the scripts of another bundle's context to this bundle, which has everything that one has
+local function TakeOver(old)
+	local moving = old.Scripts()
+	local styles, editors = {}, {}
+	for index, script in moving do
+		styles[index] = old.ReadStyle(script)
+		editors[index] = old.SnapshotEditors(script)
+	end
+	local ini = old.SaveIni()
+	StartContext(moving[1].Options)
+	local ok, err = pcall(function()
+		Raw.LoadIniSettings(ini)
+		for index, script in moving do
+			Instance.Attach(script, styles[index])
+			BindScript(script, Instance)
+			Instance.RestoreEditors(script, editors[index])
+		end
+	end)
+	if not ok then
+		StopContext()
+		error(err, 0)
+	end
+	old.Stop()
+end
+
+local function CurrentInstance(level)
+	local instance = Script.Instance
+	if instance == nil or Script.Leaving then
+		error("[ImGui] call ImGui.Init() first", level + 1)
+	end
+	return instance
+end
+
+function ScriptFunctions.Init(options)
+	if Script.Instance ~= nil then
+		Script.Leaving = nil -- ImGui.Shutdown() and ImGui.Init() in the same frame: the script stays
+		return ImGui
+	end
+	options = options or {}
+	if type(options) ~= "table" then
+		error("[ImGui] ImGui.Init expects a table of options", 2)
+	end
+	if options.Theme ~= nil and ThemeFunctions[options.Theme] == nil then
+		error('[ImGui] Theme must be "Dark", "Light" or "Classic"', 2)
+	end
+	if options.Docking == true and not Features.Docking then
+		error("[ImGui] Docking needs a docking build: docking.luau or docking_debug.luau", 2)
+	end
+	local startTime = clock()
+	Script.Options = options
+
+	local group = if options.Share ~= false and options.AutoRender ~= false and options.Renderer == nil then ShareGroup() else nil
+	local host = if group ~= nil then group.Host else nil
+	if host ~= nil and (type(host) ~= "table" or host.Protocol ~= Instance.Protocol or not host.Alive()) then
+		group.Host, host = nil, nil
+	end
+	if host ~= nil and host ~= Instance then
+		if Covers(host.Features, Features) then
+			host.Attach(Script)
+			BindScript(Script, host)
+		elseif not Initialized and not host.InFrame() and Covers(Features, host.Features) then
+			TakeOver(host)
+			group.Host, Group = Instance, group
+			Instance.Attach(Script)
+			BindScript(Script, Instance)
+		else
+			if not WarnedSeparate then
+				WarnedSeparate = true
+				warn(sformat("[ImGui] another script runs %s.luau and this one %s.luau, and each has something the other lacks: "
+					.. "their windows are drawn separately. Load the same bundle in both to share.", tostring(host.Build), tostring(Instance.Build)))
+			end
+			group = nil
+		end
+	end
+	if Script.Instance == nil then
+		if not Initialized then
+			StartContext(options)
+			if group ~= nil and group.Host == nil then
+				group.Host, Group = Instance, group
+			end
+		end
+		Instance.Attach(Script)
+		BindScript(Script, Instance)
+	end
+	Script.Shared = Script.Instance ~= Instance or Group ~= nil
 	ImGui.InitTime = clock() - startTime
 	return ImGui
 end
 
--- Runs one Dear ImGui frame: input -> NewFrame -> OnFrame callbacks -> Render -> render mode calls.
-function ImGui.Step(deltaTime, displayWidth, displayHeight)
+function ScriptFunctions.Shutdown()
+	local instance = Script.Instance
+	if instance == nil or Script.Leaving then
+		return
+	end
+	tclear(Script.Callbacks)
+	tclear(Script.Fonts)
+	ImGui.RenderMode = nil
+	instance.Detach(Script)
+end
+
+function ScriptFunctions.IsInitialized()
+	return Script.Instance ~= nil and not Script.Leaving
+end
+
+function ScriptFunctions.OnFrame(callback)
+	table.insert(Script.Callbacks, callback)
+	return {
+		Disconnect = function()
+			local index = table.find(Script.Callbacks, callback)
+			if index then
+				table.remove(Script.Callbacks, index)
+			end
+		end,
+	}
+end
+
+-- Runs one frame: input -> NewFrame -> every script's OnFrame callbacks -> Render -> render mode calls.
+-- Only for AutoRender = false, which never shares: a shared context's frame loop steps it.
+function ScriptFunctions.Step(deltaTime, displayWidth, displayHeight)
+	if CurrentInstance(2) == Instance and not Script.Shared then
+		Step(deltaTime, displayWidth, displayHeight)
+	end
+end
+
+-- Stays valid when the script moves to another bundle's context, and always edits the script's own style
+local StyleProxy = setmetatable({}, {
+	__index = function(_, key)
+		local handle = CurrentInstance(2).StyleHandle(Script)
+		local value = handle[key]
+		if type(value) == "function" then
+			return function(_, ...)
+				return value(handle, ...)
+			end
+		end
+		return value
+	end,
+	__newindex = function(_, key, value)
+		CurrentInstance(2).StyleHandle(Script)[key] = value
+	end,
+})
+
+local IOCache = { Instance = nil, Generation = 0, Handle = nil }
+local function IOHandle()
+	local instance = CurrentInstance(3)
+	local generation = instance.Generation()
+	if IOCache.Instance ~= instance or IOCache.Generation ~= generation then
+		IOCache.Instance, IOCache.Generation, IOCache.Handle = instance, generation, instance.Api().GetIO()
+	end
+	return IOCache.Handle
+end
+
+local IOProxy = setmetatable({}, {
+	__index = function(_, key)
+		local handle = IOHandle()
+		local value = handle[key]
+		if type(value) == "function" then
+			return function(_, ...)
+				return value(handle, ...)
+			end
+		end
+		return value
+	end,
+	__newindex = function(_, key, value)
+		IOHandle()[key] = value
+	end,
+})
+
+function ScriptFunctions.GetStyle()
+	CurrentInstance(2)
+	return StyleProxy
+end
+
+function ScriptFunctions.GetIO()
+	CurrentInstance(2)
+	return IOProxy
+end
+
+-- font: a font name ("UI", "System", "Plex", "Monospace") or a Drawing font index. Returns the font for
+-- ImGui.PushFont(font, size): an ImFont pointer, or when sharing a table that follows the script to another bundle.
+function ScriptFunctions.AddFont(font, sizePixels, mergeMode)
+	local instance = CurrentInstance(2)
+	sizePixels = sizePixels or 13
+	local pointer = instance.AddFont(font, sizePixels, mergeMode)
+	if not Script.Shared then
+		return pointer
+	end
+	local token = { __ptr = pointer, Font = font, Size = sizePixels, Merge = mergeMode == true }
+	table.insert(Script.Fonts, token)
+	return token
+end
+
+for _, name in { "StyleColorsDark", "StyleColorsLight", "StyleColorsClassic" } do
+	ScriptFunctions[name] = function(dst)
+		local instance = CurrentInstance(2)
+		return instance.Api()[name](dst or instance.StyleHandle(Script))
+	end
+end
+
+-- ImGui.TextEditor.new() creates a text editor (see the text editor addon section); Languages and Colors list the names
+-- SetLanguage and SetPaletteColor take
+ScriptFunctions.TextEditor = {
+	new = function()
+		return CurrentInstance(2).NewEditor(Script)
+	end,
+	Languages = table.clone(EditorLanguages),
+	Colors = table.clone(EditorColors),
+}
+
+-- Shared: whether the script shares a context with other scripts. Role: "host" when this script's bundle runs that
+-- context, "client" when another script's bundle does, "private" without sharing. Scripts: how many scripts draw
+-- with the context. Build: the bundle running it.
+function ScriptFunctions.GetShareInfo()
+	local instance = Script.Instance
+	if instance == nil or Script.Leaving then
+		return nil
+	end
+	return {
+		Shared = Script.Shared,
+		Role = if not Script.Shared then "private" elseif instance == Instance then "host" else "client",
+		Scripts = instance.ScriptCount(),
+		Build = instance.Build,
+	}
+end
+
+--------------------------------------------------------------------------------
+-- Frames and context-wide functions
+--------------------------------------------------------------------------------
+
+function Step(deltaTime, displayWidth, displayHeight)
 	if not Initialized then
 		error("[ImGui] call ImGui.Init() first", 2)
 	end
@@ -1235,27 +2231,22 @@ function ImGui.Step(deltaTime, displayWidth, displayHeight)
 	local stackPointer = (F.emscripten_stack_get_current[1](F.emscripten_stack_get_current))
 	F.rbx_new_frame[1](F.rbx_new_frame, displayWidth, displayHeight, deltaTime)
 	local t2 = clock()
-	local callbacks = FrameCallbacks
 	InFrame = true
-	for i = 1, #callbacks do
-		local callback = callbacks[i]
-		if callback then
-			local ok, err = pcall(callback, ImGui)
-			if not ok then
-				warn("[ImGui] frame callback error: " .. tostring(err))
-				F._emscripten_stack_restore[1](F._emscripten_stack_restore, stackPointer)
-			end
-		end
-		if ShutdownRequested then
-			break
+	for _, script in table.clone(Scripts) do
+		if not script.Leaving and #script.Callbacks > 0 then
+			RunScript(script, stackPointer)
 		end
 	end
 	InFrame = false
-	if ShutdownRequested then
-		-- A callback called ImGui.Shutdown(): end the frame without drawing it, then shut down
-		ShutdownRequested = false
+	for _, script in table.clone(Scripts) do
+		if script.Leaving then
+			RemoveScript(script)
+		end
+	end
+	if #Scripts == 0 then
+		-- Every script called ImGui.Shutdown() from a frame callback: end the frame without drawing it, then stop
 		F.rbx_render[1](F.rbx_render)
-		ImGui.Shutdown()
+		StopContext()
 		return
 	end
 	local t3 = clock()
@@ -1280,7 +2271,7 @@ function ImGui.Step(deltaTime, displayWidth, displayHeight)
 	stats.Total = clock() - t0
 end
 
--- Seconds spent in each part of the last ImGui.Step(): Input, NewFrame, Callbacks (your UI code),
+-- Seconds spent in each part of the last frame: Input, NewFrame, Callbacks (the scripts' UI code),
 -- Render (ImGui::Render + draw table), Draw (render mode calls) and Total.
 function ImGui.GetFrameStats()
 	return FrameStats
@@ -1291,54 +2282,6 @@ end
 -- comparison confirmed the advances (Verified), how many comparisons ran (Attempts) and the last Ratio.
 function ImGui.GetTextMetricsInfo()
 	return if TextMetrics ~= nil then TextMetrics.Info() else nil
-end
-
-function ImGui.OnFrame(callback)
-	table.insert(FrameCallbacks, callback)
-	return {
-		Disconnect = function()
-			local index = table.find(FrameCallbacks, callback)
-			if index then
-				table.remove(FrameCallbacks, index)
-			end
-		end,
-	}
-end
-
-function ImGui.Shutdown()
-	if InFrame then
-		ShutdownRequested = true -- called from a frame callback: ImGui.Step shuts down once the callbacks return
-		return
-	end
-	for _, connection in Connections do
-		pcall(function()
-			connection:Disconnect()
-		end)
-	end
-	tclear(Connections)
-	tclear(FrameCallbacks)
-	if InputCleanup then
-		InputCleanup()
-	end
-	InputPump, InputPost, InputCleanup = nil, nil, nil
-	if Initialized then
-		F.rbx_shutdown[1](F.rbx_shutdown)
-	end
-	if Backend ~= nil and Backend.Destroy ~= nil then
-		pcall(Backend.Destroy)
-	end
-	if TextMetrics ~= nil then
-		TextMetrics.Destroy()
-		TextMetrics = nil
-	end
-	Backend, RenderMode, RenderDrawData = nil, nil, nil
-	ImGui.RenderMode = nil
-	tclear(FontSlots)
-	Initialized = false
-end
-
-function ImGui.IsInitialized()
-	return Initialized
 end
 
 function ImGui.AddMousePosEvent(x, y)
@@ -1398,24 +2341,13 @@ function ImGui.GetMouseCursorShape()
 	return rshift(band(IOState, 0xFF00), 8) - 1
 end
 
--- font: a font name ("UI", "System", "Plex", "Monospace") or a Drawing font index.
--- Returns the ImFont pointer for ImGui.PushFont(font, size).
-function ImGui.AddFont(font, sizePixels, mergeMode)
-	if not Initialized then
-		error("[ImGui] call ImGui.Init() first", 2)
-	end
-	local slot = AllocateFontSlot(Renderer.ResolveFont(RenderMode, font))
-	return (F.rbx_add_font[1](F.rbx_add_font, slot, sizePixels or 13, if mergeMode then 1 else 0))
-end
-
 function ImGui.SaveIniSettings()
 	return ReadCString(Mem(), (F.rbx_save_ini[1](F.rbx_save_ini))) or ""
 end
 
 function ImGui.LoadIniSettings(ini)
-	local mem = Mem()
 	local ptr = (F.malloc[1](F.malloc, #ini + 1))
-	mem = Mem()
+	local mem = Mem() -- after malloc, which can grow the memory
 	writestring(mem, ptr, ini)
 	writeu8(mem, ptr + #ini, 0)
 	F.rbx_load_ini[1](F.rbx_load_ini, ptr)
@@ -1429,5 +2361,20 @@ if InstallBindings then
 end
 -- True in the docking builds (docking.luau, docking_debug.luau)
 ImGui.HasDocking = ImGui.ConfigFlags ~= nil and ImGui.ConfigFlags.DockingEnable ~= nil
+-- The bundle's name: "imgui", "imgui_debug", "docking" or "docking_debug"
+ImGui.Build = if BuildName ~= nil and BuildName ~= "" then BuildName else nil
+-- True in the bundles with the text editor addon (ImGui.TextEditor): the _editor and _debug builds
+ImGui.HasTextEditor = HasTextEditor == true
+Features = {
+	Docking = ImGui.HasDocking,
+	Debug = if ImGui.Build ~= nil then sfind(ImGui.Build, "_debug$") ~= nil else ImGui.ShowFontSelector ~= nil,
+	TextEditor = ImGui.HasTextEditor,
+}
+Instance.Features = Features
+Instance.Build = ImGui.Build
+Raw = table.clone(ImGui) -- this bundle's own functions, which BindScript copies into the tables of scripts it hosts
+for name, fn in ScriptFunctions do
+	ImGui[name] = fn
+end
 
 return ImGui

@@ -17,7 +17,7 @@ Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** librar
 |---|---|
 | **Compatibility** | Runs on Potassium's DrawingImmediate and on any executor with a Drawing library, detected automatically, with any keyboard layout. |
 | **Stability** | Unmodified Dear ImGui, and every bundle and every example goes through the headless tests before a release. |
-| **Size** | One file per build: 3.1 MB, up to 5.3 MB with docking and the demo window. |
+| **Size** | One file per build, from 3.1 MB; addons such as the text editor only go in the builds that include them. |
 | **Parity** | Dear ImGui's API from Luau under its C++ names, generated from Dear ImGui's own metadata, docking branch included. |
 | **Optimization** | The translated code is rewritten, minified and compiled at Luau's optimization level 2: frames about 15% faster than before. |
 
@@ -34,8 +34,13 @@ Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** librar
 - **Text measured with the executor's own fonts**, checked against drawn text at runtime so wrapping stays inside windows.
 - **Docking**: `docking.luau` is built from Dear ImGui's docking branch, so windows dock into each other and into
   dockspaces.
-- **One file per build**: 3.1 MB for Dear ImGui, 3.6 MB with docking; the `_debug` builds add the demo window and the
-  debug tools.
+- **Several scripts, one UI**: scripts that each load a bundle draw with one shared Dear ImGui context, so their windows
+  stack, take focus and dock together, while each script keeps its own theme and font. `Share = false` opts out.
+- **Text editor addon**: [ImGuiColorTextEdit](https://github.com/goossens/ImGuiColorTextEdit) as `ImGui.TextEditor`,
+  with syntax highlighting (Luau, Lua, C/C++, Python, JSON, Markdown, SQL and more), undo/redo, find and replace and
+  multiple cursors.
+- **One file per build**: 3.1 MB for Dear ImGui, 3.7 MB with docking. The `_editor` builds add the text
+  editor; the `_debug` builds add the demo window, the debug tools and the text editor.
 
 ## Quick start
 
@@ -60,7 +65,7 @@ end)
 ```
 
 More in the wiki: [Getting started](../../wiki/Getting-Started) · [Init options & render modes](../../wiki/Init-Options-and-Render-Modes) ·
-[Luau API guide](../../wiki/Luau-API-Guide) · [Building & internals](../../wiki/Building-and-Internals).
+[Luau API guide](../../wiki/Luau-API-Guide) · [Text editor](../../wiki/Text-Editor) · [Building & internals](../../wiki/Building-and-Internals).
 
 ## Examples
 
@@ -74,6 +79,7 @@ More in the wiki: [Getting started](../../wiki/Getting-Started) · [Init options
 | [`settings_persistence.luau`](examples/settings_persistence.luau) | settings and window layout saved between runs, a close button that shuts everything down |
 | [`player_list.luau`](examples/player_list.luau) | a searchable table of the players in the server with a right-click menu |
 | [`console.luau`](examples/console.luau) | a colored, filterable log with a command line |
+| [`text_editor.luau`](examples/text_editor.luau) | a Luau script editor with syntax highlighting, find and replace and a Run button (`imgui_editor.luau`) |
 | [`potassium_demo.luau`](examples/potassium_demo.luau) | the demo window next to a panel of widgets and a draw list (`imgui_debug.luau`) |
 
 `python build.py test` runs every example, so they keep working with each release.
@@ -83,9 +89,11 @@ More in the wiki: [Getting started](../../wiki/Getting-Started) · [Init options
 | File | Size | |
 |---|---|---|
 | `imgui.luau` | 3.1 MB | Dear ImGui: every widget, without the demo window and debug tools |
-| `imgui_debug.luau` | 4.6 MB | the same plus `ImGui.ShowDemoWindow()`, the Metrics/Debugger and the other debug tools |
-| `docking.luau` | 3.6 MB | Dear ImGui's docking branch: windows dock into each other and into dockspaces |
-| `docking_debug.luau` | 5.3 MB | the docking branch plus the demo window and debug tools |
+| `imgui_editor.luau` | 4.3 MB | `imgui.luau` plus the text editor (`ImGui.TextEditor`) |
+| `imgui_debug.luau` | 5.8 MB | plus `ImGui.ShowDemoWindow()`, the Metrics/Debugger, the other debug tools and the text editor |
+| `docking.luau` | 3.7 MB | Dear ImGui's docking branch: windows dock into each other and into dockspaces |
+| `docking_editor.luau` | 4.8 MB | `docking.luau` plus the text editor |
+| `docking_debug.luau` | 6.4 MB | the docking branch plus the demo window, the debug tools and the text editor |
 
 Every file loads the same way; change the name at the end of the URL, e.g. `https://github.com/lithium1on/imgui-roblox/releases/latest/download/docking.luau`.
 
@@ -95,8 +103,8 @@ Needs Python 3.9+ and, for the first setup, [Rust](https://rustup.rs) (Spider is
 macOS and Linux (use `python3` where `python` is missing):
 
 ```bash
-python build.py setup   # downloads Dear ImGui, dear_bindings, Emscripten, Spider (compiled with cargo) and Luau
-python build.py         # builds dist/imgui.luau, imgui_debug.luau, docking.luau and docking_debug.luau
+python build.py setup   # downloads Dear ImGui, dear_bindings, ImGuiColorTextEdit, Emscripten, Spider (compiled with cargo) and Luau
+python build.py         # builds the six bundles into dist/
 python build.py test    # runs the headless tests against every bundle
 ```
 
@@ -108,13 +116,13 @@ python build.py test    # runs the headless tests against every bundle
 | Path | |
 |---|---|
 | `build.py` | setup, build, test and benchmark |
-| `src/` | C++ backend: font loader, input, draw data export, libc routed to Luau |
-| `luau/` | runtime (`ImGui.Init`, input, WebAssembly imports) and renderer (DrawingImmediate, Drawing) |
+| `src/` | C++ backend: font loader, input, draw data export, libc routed to Luau; `src/addons/`: the text editor's exports |
+| `luau/` | runtime (`ImGui.Init`, sharing between scripts, the text editor, input, WebAssembly imports) and renderer (DrawingImmediate, Drawing) |
 | `tools/` | bindings generator, Spider output optimizer and minifier, bundler |
 | `tests/harness/` | headless tests run with the Luau CLI against mock executor libraries |
 | `examples/` | example scripts |
 
 ## License
 
-[MIT](LICENSE) for this project. The bundles include Dear ImGui (MIT) and Spider's runtime helpers (MPL-2.0): see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[MIT](LICENSE) for this project. The bundles include Dear ImGui (MIT), ImGuiColorTextEdit (MIT, in the `_editor` and
+`_debug` builds) and Spider's runtime helpers (MPL-2.0): see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

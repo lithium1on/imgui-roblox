@@ -165,3 +165,9 @@ float  strtof(const char* str, char** out_end) { return (float)rbx_host_strtod(s
 double atof(const char* str)                   { return rbx_host_strtod(str, NULL); }
 
 } // extern "C"
+
+// libc++ refers to strtold: defining it here keeps the musl strtod.c object, which also defines strtod and strtof, out of the link
+extern "C" long double strtold(const char* str, char** out_end)
+{
+    return rbx_host_strtod(str, out_end);
+}

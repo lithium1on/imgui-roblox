@@ -39,6 +39,7 @@ RBX_HOST_IMPORT(glyph_advance) double rbx_host_glyph_advance(int font_slot, doub
 RBX_HOST_IMPORT(set_clipboard) void   rbx_host_set_clipboard(const char* text);
 RBX_HOST_IMPORT(assert_failed) void   rbx_host_assert_failed(const char* expr, const char* file, int line);
 RBX_HOST_IMPORT(log_message)   void   rbx_host_log_message(const char* text);
+RBX_HOST_IMPORT(clock_now)     double rbx_host_clock_now(void); // seconds, for clock_gettime (used by the text editor addon)
 
 #ifdef __cplusplus
 }

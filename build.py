@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Dear ImGui for Roblox: set up the toolchains, build, test and benchmark, on Windows, macOS and Linux.
 
-    python build.py setup           download Dear ImGui (master and docking), dear_bindings, Emscripten, Spider and Luau
+    python build.py setup           download Dear ImGui (master and docking), dear_bindings, ImGuiColorTextEdit, Emscripten, Spider, Luau
     python build.py                 build every bundle into dist/
-    python build.py docking         build some of them: imgui, imgui_debug, docking, docking_debug
+    python build.py docking         build some of them (names below, without .luau)
     python build.py test            run the headless tests and the examples against every bundle
     python build.py test examples   only run the scripts in examples/ (or: test api_test --only docking)
     python build.py bench           frame time on a demo scene (--bundle, --rounds, --luau-opt)
@@ -11,10 +11,12 @@
     python build.py clean           delete build/ and dist/
 
 Bundles:
-    imgui.luau           Dear ImGui (master branch) without the demo window and debug tools
-    imgui_debug.luau     Dear ImGui with the demo window, metrics and debug tools
-    docking.luau         Dear ImGui docking branch without the demo window and debug tools
-    docking_debug.luau   docking branch with the demo window, metrics and debug tools
+    imgui.luau            Dear ImGui (master branch) without the demo window and debug tools
+    imgui_editor.luau     imgui.luau plus the text editor addon (ImGuiColorTextEdit)
+    imgui_debug.luau      Dear ImGui with the demo window, metrics, debug tools and the text editor
+    docking.luau          Dear ImGui docking branch without the demo window and debug tools
+    docking_editor.luau   docking.luau plus the text editor addon
+    docking_debug.luau    docking branch with the demo window, metrics, debug tools and the text editor
 
 Requirements: Python 3.9 or newer. The first setup also needs Rust (https://rustup.rs), because Spider is compiled from
 source.
@@ -50,7 +52,9 @@ DEAR_BINDINGS_VERSION = "0.21"
 EMSDK_VERSION = "6.0.9"
 SPIDER_COMMIT = "cfaf2fb7d68988d0183fb65d4182f3a5a1127282"
 LUAU_VERSION = "0.738"
-NOTICE = "Dear ImGui (c) Omar Cornut, MIT License; Spider runtime helpers, MPL-2.0"
+TEXT_EDITOR_COMMIT = "f28136480fa4091164e0b528dc9cca147c5a6ee9"  # goossens/ImGuiColorTextEdit, made for Dear ImGui 1.92.9
+TEXT_EDITOR = THIRD_PARTY / "ImGuiColorTextEdit"
+NOTICE = "Dear ImGui (c) Omar Cornut and ImGuiColorTextEdit (c) Johan A. Goossens, MIT License; Spider runtime helpers, MPL-2.0"
 EXE = ".exe" if os.name == "nt" else ""
 
 BRANCHES = {
@@ -74,10 +78,12 @@ LEAN_CFLAGS = ["-DIMGUI_DISABLE_DEMO_WINDOWS", "-DIMGUI_DISABLE_DEBUG_TOOLS"]
 LEAN_EXCLUDE = ["ImGui_ShowFontSelector", "ImGui_DebugTextEncoding", "ImGui_DebugFlashStyleColor"]
 
 VARIANTS = {
-    "imgui": {"branch": "master", "debug": False},
-    "imgui_debug": {"branch": "master", "debug": True},
-    "docking": {"branch": "docking", "debug": False},
-    "docking_debug": {"branch": "docking", "debug": True},
+    "imgui": {"branch": "master", "debug": False, "text_editor": False},
+    "imgui_editor": {"branch": "master", "debug": False, "text_editor": True},
+    "imgui_debug": {"branch": "master", "debug": True, "text_editor": True},
+    "docking": {"branch": "docking", "debug": False, "text_editor": False},
+    "docking_editor": {"branch": "docking", "debug": False, "text_editor": True},
+    "docking_debug": {"branch": "docking", "debug": True, "text_editor": True},
 }
 
 COMMON_TESTS = [
@@ -86,6 +92,14 @@ COMMON_TESTS = [
 ]
 DEBUG_TESTS = ["help_section_test", "demo_stress_test"]  # need the demo window
 DOCKING_TESTS = ["docking_test"]
+EDITOR_TESTS = ["text_editor_test"]  # need the text editor addon
+# share_test runs two scripts, each with its own copy of a bundle: a second bundle with nothing new joins the first, one
+# with more takes over (text editors included), and bundles that each lack something the other has stay separate
+SHARE_PAIRS = [
+    ("imgui", "imgui"), ("imgui_debug", "imgui"), ("imgui", "docking_debug"), ("docking", "imgui"),
+    ("docking", "imgui_debug"), ("docking_debug", "docking_debug"), ("imgui", "imgui_editor"),
+    ("imgui_editor", "docking_debug"), ("docking_editor", "imgui_editor"), ("imgui_editor", "docking"),
+]
 # The line every example loads its bundle with; the test runs the example against that bundle from dist/
 EXAMPLE_LOAD = re.compile(
     r'loadstring\(game:HttpGet\("https://github\.com/lithium1on/imgui-roblox/releases/latest/download/(\w+)\.luau"\)\)\(\)'
@@ -134,6 +148,8 @@ def tests_for(name: str) -> list[str]:
         tests += DEBUG_TESTS
     if variant["branch"] == "docking":
         tests += DOCKING_TESTS
+    if variant["text_editor"]:
+        tests += EDITOR_TESTS
     return tests
 
 
@@ -204,6 +220,14 @@ def setup_dear_bindings() -> None:
         target.write_bytes(download(f"https://github.com/dearimgui/dear_bindings/releases/download/{branch['release']}/dcimgui.json"))
 
 
+def setup_text_editor() -> None:
+    if (TEXT_EDITOR / "TextEditor.cpp").exists():
+        print(f"   ImGuiColorTextEdit: {relative(TEXT_EDITOR)} is ready")
+        return
+    step(f"ImGuiColorTextEdit {TEXT_EDITOR_COMMIT[:8]}")
+    extract_archive(download(f"https://github.com/goossens/ImGuiColorTextEdit/archive/{TEXT_EDITOR_COMMIT}.zip"), TEXT_EDITOR)
+
+
 def setup_emscripten() -> None:
     target = TOOLS / "emsdk"
     if not (target / "emsdk.py").exists():
@@ -261,6 +285,7 @@ def setup_luau() -> None:
 def command_setup(args) -> int:
     setup_imgui()
     setup_dear_bindings()
+    setup_text_editor()
     setup_emscripten()
     setup_spider()
     setup_luau()
@@ -309,14 +334,24 @@ def build_variant(name: str, args) -> None:
         "--out-cpp", gen / "imgui_bindings.cpp", "--out-luau", gen / "bindings.luau", "--exclude", ",".join(excluded),
     ])
 
-    step(f"compiling to WebAssembly ({args.opt})")
+    compile_flags = [
+        "-std=c++17", "-DNDEBUG", "-fno-exceptions", "-fno-rtti",
+        f"-I{imgui}", f"-I{ROOT / 'src'}", f"-I{TEXT_EDITOR}", '-DIMGUI_USER_CONFIG="imconfig_roblox.h"', *cflags,
+    ]
     sources = [ROOT / "src" / file for file in ("imgui_rbx.cpp", "rbx_libc.cpp", "rbx_stbtt_stubs.cpp")]
     sources += [imgui / file for file in ("imgui.cpp", "imgui_draw.cpp", "imgui_widgets.cpp", "imgui_tables.cpp", "imgui_demo.cpp")]
     sources.append(gen / "imgui_bindings.cpp")
+    if variant["text_editor"]:
+        # Compiled for size: the editor is a third of the module at -O2, and its speed matters less than Dear ImGui's
+        step("compiling the text editor addon (-Oz)")
+        for source in (TEXT_EDITOR / "TextEditor.cpp", ROOT / "src" / "addons" / "text_editor.cpp"):
+            obj = build / f"{source.stem}.o"
+            run([sys.executable, em_tool("em++"), "-c", source, *compile_flags, "-Oz", "-o", obj], env=emscripten_env())
+            sources.append(obj)
+
+    step(f"compiling to WebAssembly ({args.opt})")
     run([
-        sys.executable, em_tool("em++"), *sources,
-        "-std=c++17", *args.opt.split(), "-DNDEBUG", "-fno-exceptions", "-fno-rtti",
-        f"-I{imgui}", f"-I{ROOT / 'src'}", '-DIMGUI_USER_CONFIG="imconfig_roblox.h"', *cflags,
+        sys.executable, em_tool("em++"), *sources, *args.opt.split(), *compile_flags,
         "-sSTANDALONE_WASM", "--no-entry",
         "-sEXPORTED_FUNCTIONS=_malloc,_free,_emscripten_stack_get_current,__emscripten_stack_restore",
         "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=16777216", "-sSTACK_SIZE=1048576",
@@ -343,10 +378,12 @@ def build_variant(name: str, args) -> None:
         sys.executable, tools / "bundle.py", "--wasm-luau", wasm_luau,
         "--runtime", ROOT / "luau" / "runtime.luau", "--renderer", ROOT / "luau" / "renderer.luau",
         "--bindings", gen / "bindings.luau", "--version", branch["label"], "--date", args.date,
-        "--notice", NOTICE, "--out", out,
+        "--notice", NOTICE, "--build-name", name, "--out", out,
     ]
     if args.optimize_directive:
         command.append("--optimize-directive")
+    if variant["text_editor"]:
+        command.append("--text-editor")
     run(command)
 
 
@@ -363,6 +400,8 @@ def command_build(args) -> int:
     require_compilers()
     branches = {VARIANTS[name]["branch"] for name in names}
     require([path for key in branches for path in (BRANCHES[key]["imgui"] / "imgui.cpp", BRANCHES[key]["bindings"] / "dcimgui.json")])
+    if any(VARIANTS[name]["text_editor"] for name in names):
+        require([TEXT_EDITOR / "TextEditor.cpp"])
     started = time.time()
     for name in names:
         build_variant(name, args)
@@ -429,10 +468,24 @@ def run_example(path: Path, bundle_name: str, luau: str) -> tuple[int, str]:
     return run_luau(f"example_{path.stem}", source, luau, ["-O2"])
 
 
+def run_share_pair(first: str, second: str, luau: str) -> tuple[int, str]:
+    """Runs tests/harness/share_test.luau with two copies of bundles, as two scripts would load them."""
+    for name in (first, second):
+        require_bundle(bundle_path(name))
+    source = (
+        read(HARNESS / "mock_env.luau") + read(HARNESS / "widgets_ui.luau")
+        + f'\nShareBuildA, ShareBuildB = "{first}", "{second}"\n'
+        + "ImGuiBundleA = (function(...)\n" + read(bundle_path(first)) + "\nend)()\n"
+        + "ImGuiBundleB = (function(...)\n" + read(bundle_path(second)) + "\nend)()\n"
+        + read(HARNESS / "share_test.luau")
+    )
+    return run_luau(f"share_test_{first}_{second}", source, luau, ["-O2"])
+
+
 def report(label: str, test: str, code: int, output: str, started: float) -> bool:
     lines = output.splitlines()
     passed = code == 0 and any(line.startswith("RESULT 0 ") for line in lines)
-    print(f"{'ok  ' if passed else 'FAIL'}  {label:<20} {test} ({time.time() - started:.1f} s)", flush=True)
+    print(f"{'ok  ' if passed else 'FAIL'}  {label:<26} {test} ({time.time() - started:.1f} s)", flush=True)
     if not passed:
         shown = [line for line in lines if line.startswith("FAIL") or "error" in line.lower()] or lines[-10:]
         for line in shown[:20]:
@@ -451,6 +504,14 @@ def command_test(args) -> int:
             started = time.time()
             code, output = run_harness(HARNESS / f"{test}.luau", bundle_path(name), f"_{name}", luau, ["-O2"])
             failures += not report(f"{name}.luau", test, code, output, started)
+
+    if not args.tests or "share_test" in args.tests:
+        for first, second in SHARE_PAIRS:
+            if first not in names or second not in names:
+                continue
+            started = time.time()
+            code, output = run_share_pair(first, second, luau)
+            failures += not report(f"{first}+{second}", "share_test", code, output, started)
 
     if not args.tests or "examples" in args.tests:
         for example in sorted(EXAMPLES.glob("*.luau")):

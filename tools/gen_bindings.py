@@ -873,6 +873,8 @@ return function(ImGui, Api)
 """
 
 LUAU_EPILOGUE = r"""
+	Api.Handle = Handle -- the runtime copies styles between scripts through these
+	Api.ClassFields = ClassFields
 	Api.OnInit = function()
 		local E = Api.Exports
 		S0 = Api.Scratch
