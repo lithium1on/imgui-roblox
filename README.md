@@ -11,9 +11,9 @@ Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** librar
 
 ![Dear ImGui's demo window and a simple overlay running in a Roblox game](docs/images/showcase.gif)
 
-## Values
+## Our goals
 
-| | |
+| Values | Meaning |
 |---|---|
 | **Compatibility** | Runs on Potassium's DrawingImmediate and on any executor with a Drawing library, detected automatically, with any keyboard layout. |
 | **Stability** | Unmodified Dear ImGui, and every bundle and every example goes through the headless tests before a release. |
