@@ -24,14 +24,17 @@ Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** librar
 - **Real input**: mouse, wheel, keyboard layouts (AZERTY, AltGr, accents), Ctrl+V paste. Clicks and keys don't reach
   the game while you use a window.
 - **Text measured with the executor's own fonts**, checked against drawn text at runtime so wrapping stays inside windows.
-- **One file**: 4.6 MB, or 3.1 MB without the demo window and debug tools.
+- **Docking**: `docking.luau` is built from Dear ImGui's docking branch, so windows dock into each other and into
+  dockspaces.
+- **One file per build**: 3.1 MB for Dear ImGui, 3.6 MB with docking; the `_debug` builds add the demo window and the
+  debug tools.
 
 ## Quick start
 
 Load the latest release straight from GitHub:
 
 ```lua
-local ImGui = loadstring(game:HttpGet("https://github.com/lithium1on/imgui-roblox/releases/latest/download/imgui_roblox.luau"))()
+local ImGui = loadstring(game:HttpGet("https://github.com/lithium1on/imgui-roblox/releases/latest/download/imgui.luau"))()
 ImGui.Init({ Font = "Monospace", FontSize = 14 }) -- DrawingImmediate on Potassium, Drawing elsewhere
 
 local speed = 16
@@ -57,10 +60,12 @@ A complete script: [`examples/potassium_demo.luau`](examples/potassium_demo.luau
 
 | File | Size | |
 |---|---|---|
-| `imgui_roblox.luau` | 4.6 MB | everything, including `ImGui.ShowDemoWindow()` and the metrics/debug tools |
-| `imgui_roblox_lite.luau` | 3.1 MB | the same without the demo window and debug tools |
+| `imgui.luau` | 3.1 MB | Dear ImGui: every widget, without the demo window and debug tools |
+| `imgui_debug.luau` | 4.6 MB | the same plus `ImGui.ShowDemoWindow()`, the Metrics/Debugger and the other debug tools |
+| `docking.luau` | 3.6 MB | Dear ImGui's docking branch: windows dock into each other and into dockspaces |
+| `docking_debug.luau` | 5.3 MB | the docking branch plus the demo window and debug tools |
 
-For the lite bundle, load `https://github.com/lithium1on/imgui-roblox/releases/latest/download/imgui_roblox_lite.luau` instead.
+Every file loads the same way; change the name at the end of the URL, e.g. `https://github.com/lithium1on/imgui-roblox/releases/latest/download/docking.luau`.
 
 ## Building from source
 
@@ -69,12 +74,12 @@ macOS and Linux (use `python3` where `python` is missing):
 
 ```bash
 python build.py setup   # downloads Dear ImGui, dear_bindings, Emscripten, Spider (compiled with cargo) and Luau
-python build.py         # builds dist/imgui_roblox.luau and dist/imgui_roblox_lite.luau
-python build.py test    # runs every headless test against both bundles
+python build.py         # builds dist/imgui.luau, imgui_debug.luau, docking.luau and docking_debug.luau
+python build.py test    # runs the headless tests against every bundle
 ```
 
-`python build.py --help` lists the rest (`full`, `lite`, `bench`, `toolchain`, `clean`, `--opt -Oz` for a smaller
-bundle). Step-by-step instructions and troubleshooting: [Building & internals](../../wiki/Building-and-Internals).
+`python build.py --help` lists the rest (`python build.py docking` for one bundle, `bench`, `toolchain`, `clean`,
+`--opt -Oz` for smaller bundles). Step-by-step instructions and troubleshooting: [Building & internals](../../wiki/Building-and-Internals).
 
 ## Repository layout
 

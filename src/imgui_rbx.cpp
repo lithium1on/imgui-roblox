@@ -169,6 +169,9 @@ RBX_EXPORT int rbx_init(int font_slot, double font_size)
     io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
     io.ConfigErrorRecoveryEnableAssert = false; // Unbalanced Begin/End from Luau shows a tooltip instead of asserting.
+#ifdef IMGUI_HAS_DOCK
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable; // Docking builds dock by default; ImGui.Init({ Docking = false }) turns it off.
+#endif
 
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
     platform_io.Platform_GetClipboardTextFn = Rbx_GetClipboardText;

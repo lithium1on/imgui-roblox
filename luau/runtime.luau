@@ -992,6 +992,7 @@ local Backend, RenderMode = nil, nil
 local FontSlots = {} -- font slot (0-7, stored in glyph texels) -> Drawing font index
 local LastFrameError, LastFrameErrorTime = nil, 0
 local TextMetrics = nil -- checks glyph advances against drawn text (Renderer.CreateGlyphMeasurer)
+local InFrame, ShutdownRequested = false, false -- ImGui.Shutdown() from a frame callback waits for the frame to end
 
 local RequiredExports = {
 	"_initialize", "malloc", "free", "emscripten_stack_get_current", "_emscripten_stack_restore",
@@ -1118,6 +1119,10 @@ local function ApplyStyleOptions(options)
 	if options.IniSettings ~= nil then
 		ImGui.LoadIniSettings(options.IniSettings)
 	end
+	if ImGui.HasDocking and options.Docking == false then
+		local io = ImGui.GetIO()
+		io.ConfigFlags = band(io.ConfigFlags, bit32.bnot(ImGui.ConfigFlags.DockingEnable))
+	end
 end
 
 function ImGui.Init(options)
@@ -1130,6 +1135,9 @@ function ImGui.Init(options)
 	end
 	if options.Theme ~= nil and ThemeFunctions[options.Theme] == nil then
 		error('[ImGui] Theme must be "Dark", "Light" or "Classic"', 2)
+	end
+	if options.Docking == true and not ImGui.HasDocking then
+		error("[ImGui] Docking needs a docking build: docking.luau or docking_debug.luau", 2)
 	end
 	local startTime = clock()
 	local mode = ResolveRenderMode(options)
@@ -1228,6 +1236,7 @@ function ImGui.Step(deltaTime, displayWidth, displayHeight)
 	F.rbx_new_frame[1](F.rbx_new_frame, displayWidth, displayHeight, deltaTime)
 	local t2 = clock()
 	local callbacks = FrameCallbacks
+	InFrame = true
 	for i = 1, #callbacks do
 		local callback = callbacks[i]
 		if callback then
@@ -1237,6 +1246,17 @@ function ImGui.Step(deltaTime, displayWidth, displayHeight)
 				F._emscripten_stack_restore[1](F._emscripten_stack_restore, stackPointer)
 			end
 		end
+		if ShutdownRequested then
+			break
+		end
+	end
+	InFrame = false
+	if ShutdownRequested then
+		-- A callback called ImGui.Shutdown(): end the frame without drawing it, then shut down
+		ShutdownRequested = false
+		F.rbx_render[1](F.rbx_render)
+		ImGui.Shutdown()
+		return
 	end
 	local t3 = clock()
 	local tablePtr = (F.rbx_render[1](F.rbx_render))
@@ -1286,6 +1306,10 @@ function ImGui.OnFrame(callback)
 end
 
 function ImGui.Shutdown()
+	if InFrame then
+		ShutdownRequested = true -- called from a frame callback: ImGui.Step shuts down once the callbacks return
+		return
+	end
 	for _, connection in Connections do
 		pcall(function()
 			connection:Disconnect()
@@ -1403,5 +1427,7 @@ Api.Mem = Mem
 if InstallBindings then
 	InstallBindings(ImGui, Api)
 end
+-- True in the docking builds (docking.luau, docking_debug.luau)
+ImGui.HasDocking = ImGui.ConfigFlags ~= nil and ImGui.ConfigFlags.DockingEnable ~= nil
 
 return ImGui

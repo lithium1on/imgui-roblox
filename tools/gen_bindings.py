@@ -38,6 +38,9 @@ SKIP_FUNCTIONS = {
     "ImGui_NewFrame", "ImGui_EndFrame", "ImGui_Render", "ImGui_GetDrawData",
     "ImGui_SetAllocatorFunctions", "ImGui_GetAllocatorFunctions",
     "ImGui_DebugCheckVersionAndDataLayout", "ImGui_LoadIniSettingsFromDisk", "ImGui_SaveIniSettingsToDisk",
+    # Docking branch: platform windows for multi-viewports, which a single Roblox screen cannot have
+    "ImGui_UpdatePlatformWindows", "ImGui_RenderPlatformWindowsDefault", "ImGui_RenderPlatformWindowsDefaultEx",
+    "ImGui_DestroyPlatformWindows",
 }
 SKIP_NAME_PARTS = ("Scalar",)
 # String arguments without a C++ default that Dear ImGui still accepts as NULL (MenuItem(label, NULL, &selected))

@@ -134,6 +134,11 @@ for _, case in cases do
 	ok, err = pcall(ImGui.Init, case[2])
 	check(string.format("%s is rejected (%s)", case[1], tostring(err)), not ok and string.find(tostring(err), case[3], 1, true) ~= nil)
 end
+if not ImGui.HasDocking then
+	ok, err = pcall(ImGui.Init, base({ RenderMode = "DrawingImmediate", DrawingImmediate = MockDrawingImmediate, Docking = true }))
+	check(string.format("Docking = true without a docking build is rejected (%s)", tostring(err)),
+		not ok and string.find(tostring(err), "Docking needs a docking build", 1, true) ~= nil)
+end
 check("failed Init calls leave ImGui uninitialized", not ImGui.IsInitialized())
 
 print(string.format("RESULT %d failure(s)", failures))

@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Dear ImGui for Roblox: set up the toolchains, build, test and benchmark, on Windows, macOS and Linux.
 
-    python build.py setup       download Dear ImGui, dear_bindings, Emscripten, Spider and Luau into third_party/ and .tools/
-    python build.py             build dist/imgui_roblox.luau and dist/imgui_roblox_lite.luau
-    python build.py full        build only one bundle (full or lite)
-    python build.py test        run every headless test against both bundles (or: test api_test text_metrics_test)
-    python build.py bench       frame time on a demo scene (--bundle, --rounds, --luau-opt)
-    python build.py toolchain   compile a small C program through Emscripten, Spider and Luau
-    python build.py clean       delete build/ and dist/
+    python build.py setup           download Dear ImGui (master and docking), dear_bindings, Emscripten, Spider and Luau
+    python build.py                 build every bundle into dist/
+    python build.py docking         build some of them: imgui, imgui_debug, docking, docking_debug
+    python build.py test            run the headless tests against every bundle (or: test api_test --only docking)
+    python build.py bench           frame time on a demo scene (--bundle, --rounds, --luau-opt)
+    python build.py toolchain       compile a small C program through Emscripten, Spider and Luau
+    python build.py clean           delete build/ and dist/
+
+Bundles:
+    imgui.luau           Dear ImGui (master branch) without the demo window and debug tools
+    imgui_debug.luau     Dear ImGui with the demo window, metrics and debug tools
+    docking.luau         Dear ImGui docking branch without the demo window and debug tools
+    docking_debug.luau   docking branch with the demo window, metrics and debug tools
 
 Requirements: Python 3.9 or newer. The first setup also needs Rust (https://rustup.rs), because Spider is compiled from
 source.
@@ -37,30 +43,48 @@ DIST = ROOT / "dist"
 HARNESS = ROOT / "tests" / "harness"
 
 IMGUI_VERSION = "1.92.9b"
-DEAR_BINDINGS_RELEASE = "DearBindings_v0.21_ImGui_v1.92.9b"
+DEAR_BINDINGS_VERSION = "0.21"
 EMSDK_VERSION = "6.0.9"
 SPIDER_COMMIT = "cfaf2fb7d68988d0183fb65d4182f3a5a1127282"
 LUAU_VERSION = "0.738"
 NOTICE = "Dear ImGui (c) Omar Cornut, MIT License; Spider runtime helpers, MPL-2.0"
 EXE = ".exe" if os.name == "nt" else ""
 
-VARIANTS = {
-    "full": {"out": DIST / "imgui_roblox.luau", "cflags": [], "exclude": []},
-    "lite": {
-        "out": DIST / "imgui_roblox_lite.luau",
-        "cflags": ["-DIMGUI_DISABLE_DEMO_WINDOWS", "-DIMGUI_DISABLE_DEBUG_TOOLS"],
-        "exclude": ["ImGui_ShowFontSelector", "ImGui_DebugTextEncoding", "ImGui_DebugFlashStyleColor"],
+BRANCHES = {
+    "master": {
+        "tag": f"v{IMGUI_VERSION}",
+        "imgui": THIRD_PARTY / "imgui",
+        "bindings": THIRD_PARTY / "dear_bindings",
+        "release": f"DearBindings_v{DEAR_BINDINGS_VERSION}_ImGui_v{IMGUI_VERSION}",
+        "label": IMGUI_VERSION,
+    },
+    "docking": {
+        "tag": f"v{IMGUI_VERSION}-docking",
+        "imgui": THIRD_PARTY / "imgui_docking",
+        "bindings": THIRD_PARTY / "dear_bindings_docking",
+        "release": f"DearBindings_v{DEAR_BINDINGS_VERSION}_ImGui_v{IMGUI_VERSION}-docking",
+        "label": f"{IMGUI_VERSION} docking",
     },
 }
-FULL_TESTS = [
+# Without the demo window and debug tools; these bindings have no definition left to link against
+LEAN_CFLAGS = ["-DIMGUI_DISABLE_DEMO_WINDOWS", "-DIMGUI_DISABLE_DEBUG_TOOLS"]
+LEAN_EXCLUDE = ["ImGui_ShowFontSelector", "ImGui_DebugTextEncoding", "ImGui_DebugFlashStyleColor"]
+
+VARIANTS = {
+    "imgui": {"branch": "master", "debug": False},
+    "imgui_debug": {"branch": "master", "debug": True},
+    "docking": {"branch": "docking", "debug": False},
+    "docking_debug": {"branch": "docking", "debug": True},
+}
+
+COMMON_TESTS = [
     "api_test", "api_guide_test", "render_modes_test", "init_options_test", "input_test", "shape_detection_test",
-    "help_section_test", "measure_test", "text_metrics_test", "demo_stress_test",
+    "measure_test", "text_metrics_test", "shutdown_test",
 ]
-LITE_TESTS = [
-    "api_test", "api_guide_test", "render_modes_test", "init_options_test", "input_test", "shape_detection_test",
-    "measure_test", "text_metrics_test",
-]
-COMMANDS = ("setup", "all", "full", "lite", "test", "bench", "toolchain", "clean")
+DEBUG_TESTS = ["help_section_test", "demo_stress_test"]  # need the demo window
+DOCKING_TESTS = ["docking_test"]
+
+COMMANDS = ("setup", "build", "test", "bench", "toolchain", "clean")
 
 
 class BuildError(Exception):
@@ -90,6 +114,20 @@ def relative(path: Path) -> str:
         return str(Path(path).relative_to(ROOT))
     except ValueError:
         return str(path)
+
+
+def bundle_path(name: str) -> Path:
+    return DIST / f"{name}.luau"
+
+
+def tests_for(name: str) -> list[str]:
+    variant = VARIANTS[name]
+    tests = list(COMMON_TESTS)
+    if variant["debug"]:
+        tests += DEBUG_TESTS
+    if variant["branch"] == "docking":
+        tests += DOCKING_TESTS
+    return tests
 
 
 # ---------------------------------------------------------------------------------------------------------------- setup
@@ -139,23 +177,24 @@ def find_cargo() -> str | None:
 
 
 def setup_imgui() -> None:
-    target = THIRD_PARTY / "imgui"
-    if (target / "imgui.cpp").exists():
-        print(f"   Dear ImGui: {relative(target)} is ready")
-        return
-    step(f"Dear ImGui v{IMGUI_VERSION}")
-    extract_archive(download(f"https://github.com/ocornut/imgui/archive/refs/tags/v{IMGUI_VERSION}.zip"), target)
+    for branch in BRANCHES.values():
+        target = branch["imgui"]
+        if (target / "imgui.cpp").exists():
+            print(f"   Dear ImGui {branch['tag']}: {relative(target)} is ready")
+            continue
+        step(f"Dear ImGui {branch['tag']}")
+        extract_archive(download(f"https://github.com/ocornut/imgui/archive/refs/tags/{branch['tag']}.zip"), target)
 
 
 def setup_dear_bindings() -> None:
-    target = THIRD_PARTY / "dear_bindings" / "dcimgui.json"
-    if target.exists():
-        print(f"   dear_bindings: {relative(target)} is ready")
-        return
-    step(f"dear_bindings metadata ({DEAR_BINDINGS_RELEASE})")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    url = f"https://github.com/dearimgui/dear_bindings/releases/download/{DEAR_BINDINGS_RELEASE}/dcimgui.json"
-    target.write_bytes(download(url))
+    for branch in BRANCHES.values():
+        target = branch["bindings"] / "dcimgui.json"
+        if target.exists():
+            print(f"   dear_bindings for {branch['tag']}: {relative(target)} is ready")
+            continue
+        step(f"dear_bindings metadata ({branch['release']})")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(download(f"https://github.com/dearimgui/dear_bindings/releases/download/{branch['release']}/dcimgui.json"))
 
 
 def setup_emscripten() -> None:
@@ -224,14 +263,14 @@ def command_setup(args) -> int:
 
 # ---------------------------------------------------------------------------------------------------------------- build
 
-def require_toolchain() -> None:
-    required = [
-        em_tool("em++"), TOOLS / "emsdk" / ".emscripten", spider_binary(),
-        THIRD_PARTY / "imgui" / "imgui.cpp", THIRD_PARTY / "dear_bindings" / "dcimgui.json",
-    ]
-    missing = [relative(path) for path in required if not path.exists()]
+def require(paths: list[Path]) -> None:
+    missing = [relative(path) for path in paths if not path.exists()]
     if missing:
         raise BuildError(f"missing {', '.join(missing)}: run python build.py setup first")
+
+
+def require_compilers() -> None:
+    require([em_tool("em++"), TOOLS / "emsdk" / ".emscripten", spider_binary()])
 
 
 def emscripten_env() -> dict:
@@ -246,29 +285,31 @@ def size(path: Path) -> str:
 
 def build_variant(name: str, args) -> None:
     variant = VARIANTS[name]
+    branch = BRANCHES[variant["branch"]]
     build = BUILD / name
     gen = build / "gen"
     gen.mkdir(parents=True, exist_ok=True)
-    out = variant["out"]
-    imgui = THIRD_PARTY / "imgui"
+    out = bundle_path(name)
+    imgui = branch["imgui"]
     tools = ROOT / "tools"
+    cflags = [] if variant["debug"] else LEAN_CFLAGS
+    excluded = [] if variant["debug"] else LEAN_EXCLUDE
     print(f"=== {name} -> {relative(out)}", flush=True)
 
     step("generating bindings")
     run([
-        sys.executable, tools / "gen_bindings.py", "--json", THIRD_PARTY / "dear_bindings" / "dcimgui.json",
-        "--out-cpp", gen / "imgui_bindings.cpp", "--out-luau", gen / "bindings.luau",
-        "--exclude", ",".join(variant["exclude"]),
+        sys.executable, tools / "gen_bindings.py", "--json", branch["bindings"] / "dcimgui.json",
+        "--out-cpp", gen / "imgui_bindings.cpp", "--out-luau", gen / "bindings.luau", "--exclude", ",".join(excluded),
     ])
 
     step(f"compiling to WebAssembly ({args.opt})")
-    sources = [ROOT / "src" / name for name in ("imgui_rbx.cpp", "rbx_libc.cpp", "rbx_stbtt_stubs.cpp")]
-    sources += [imgui / name for name in ("imgui.cpp", "imgui_draw.cpp", "imgui_widgets.cpp", "imgui_tables.cpp", "imgui_demo.cpp")]
+    sources = [ROOT / "src" / file for file in ("imgui_rbx.cpp", "rbx_libc.cpp", "rbx_stbtt_stubs.cpp")]
+    sources += [imgui / file for file in ("imgui.cpp", "imgui_draw.cpp", "imgui_widgets.cpp", "imgui_tables.cpp", "imgui_demo.cpp")]
     sources.append(gen / "imgui_bindings.cpp")
     run([
         sys.executable, em_tool("em++"), *sources,
         "-std=c++17", *args.opt.split(), "-DNDEBUG", "-fno-exceptions", "-fno-rtti",
-        f"-I{imgui}", f"-I{ROOT / 'src'}", '-DIMGUI_USER_CONFIG="imconfig_roblox.h"', *variant["cflags"],
+        f"-I{imgui}", f"-I{ROOT / 'src'}", '-DIMGUI_USER_CONFIG="imconfig_roblox.h"', *cflags,
         "-sSTANDALONE_WASM", "--no-entry",
         "-sEXPORTED_FUNCTIONS=_malloc,_free,_emscripten_stack_get_current,__emscripten_stack_restore",
         "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=16777216", "-sSTACK_SIZE=1048576",
@@ -294,7 +335,7 @@ def build_variant(name: str, args) -> None:
     command = [
         sys.executable, tools / "bundle.py", "--wasm-luau", wasm_luau,
         "--runtime", ROOT / "luau" / "runtime.luau", "--renderer", ROOT / "luau" / "renderer.luau",
-        "--bindings", gen / "bindings.luau", "--version", IMGUI_VERSION, "--date", args.date,
+        "--bindings", gen / "bindings.luau", "--version", branch["label"], "--date", args.date,
         "--notice", NOTICE, "--out", out,
     ]
     if args.optimize_directive:
@@ -302,15 +343,25 @@ def build_variant(name: str, args) -> None:
     run(command)
 
 
+def selected_variants(names: list[str]) -> list[str]:
+    names = [name for name in names if name != "all"] or list(VARIANTS)
+    unknown = [name for name in names if name not in VARIANTS]
+    if unknown:
+        raise BuildError(f"unknown bundle {', '.join(unknown)} (expected {', '.join(VARIANTS)})")
+    return names
+
+
 def command_build(args) -> int:
-    require_toolchain()
+    names = selected_variants(args.variants)
+    require_compilers()
+    branches = {VARIANTS[name]["branch"] for name in names}
+    require([path for key in branches for path in (BRANCHES[key]["imgui"] / "imgui.cpp", BRANCHES[key]["bindings"] / "dcimgui.json")])
     started = time.time()
-    names = ["full", "lite"] if args.command == "all" else [args.command]
     for name in names:
         build_variant(name, args)
     print(f"Built in {time.time() - started:.0f} s:")
     for name in names:
-        print(f"   {relative(VARIANTS[name]['out'])}  {size(VARIANTS[name]['out'])}")
+        print(f"   {relative(bundle_path(name)):<24} {size(bundle_path(name))}")
     return 0
 
 
@@ -352,17 +403,16 @@ def run_harness(script: Path, bundle: Path, tag: str, luau: str, flags: list[str
 
 def command_test(args) -> int:
     luau = find_luau(args.luau)
-    suites = [(VARIANTS["full"]["out"], "", FULL_TESTS), (VARIANTS["lite"]["out"], "_lite", LITE_TESTS)]
     failures = 0
-    for bundle, tag, tests in suites:
-        for test in tests:
+    for name in selected_variants(args.only):
+        for test in tests_for(name):
             if args.tests and test not in args.tests:
                 continue
             started = time.time()
-            code, output = run_harness(HARNESS / f"{test}.luau", bundle, tag, luau, ["-O2"])
+            code, output = run_harness(HARNESS / f"{test}.luau", bundle_path(name), f"_{name}", luau, ["-O2"])
             lines = output.splitlines()
             passed = code == 0 and any(line.startswith("RESULT 0 ") for line in lines)
-            print(f"{'ok  ' if passed else 'FAIL'}  {bundle.name:<24} {test} ({time.time() - started:.1f} s)", flush=True)
+            print(f"{'ok  ' if passed else 'FAIL'}  {name + '.luau':<20} {test} ({time.time() - started:.1f} s)", flush=True)
             if not passed:
                 failures += 1
                 shown = [line for line in lines if line.startswith("FAIL") or "error" in line.lower()] or lines[-10:]
@@ -374,7 +424,7 @@ def command_test(args) -> int:
 
 def command_bench(args) -> int:
     luau = find_luau(args.luau)
-    bundles = [Path(path).resolve() for path in args.bundle] or [VARIANTS["full"]["out"]]
+    bundles = [Path(path).resolve() for path in args.bundle] or [bundle_path("imgui_debug")]
     for round_index in range(args.rounds):
         for index, bundle in enumerate(bundles):
             code, output = run_harness(HARNESS / "bench.luau", bundle, f"_bench{index}", luau, [args.luau_opt])
@@ -384,7 +434,7 @@ def command_bench(args) -> int:
 
 
 def command_toolchain(args) -> int:
-    require_toolchain()
+    require_compilers()
     luau = find_luau(args.luau)
     work = BUILD / "toolchain"
     work.mkdir(parents=True, exist_ok=True)
@@ -423,23 +473,24 @@ def main() -> int:
         print("Python 3.9 or newer is required", file=sys.stderr)
         return 1
     argv = sys.argv[1:]
-    if not argv or (argv[0] not in COMMANDS and argv[0] not in ("-h", "--help")):
-        argv = ["all", *argv]
+    if not argv or argv[0] == "all" or argv[0] in VARIANTS or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
+        argv = ["build", *argv]
 
     parser = argparse.ArgumentParser(prog="build.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup", help="download and prepare every toolchain")
-    for name, text in (("all", "build both bundles"), ("full", "build dist/imgui_roblox.luau"), ("lite", "build dist/imgui_roblox_lite.luau")):
-        sub = commands.add_parser(name, help=text)
-        sub.add_argument("--opt", default="-O2", help="em++ optimization flags, e.g. -Oz for a smaller bundle (default -O2)")
-        sub.add_argument("--no-minify", dest="minify", action="store_false", help="keep Spider's names and layout")
-        sub.add_argument("--no-optimize-directive", dest="optimize_directive", action="store_false", help="leave out --!optimize 2")
-        sub.add_argument("--date", default=datetime.date.today().isoformat(), help="build date written in the header")
+    build = commands.add_parser("build", help="build bundles (the default command)")
+    build.add_argument("variants", nargs="*", help=f"bundles to build: {', '.join(VARIANTS)} (default: all)")
+    build.add_argument("--opt", default="-O2", help="em++ optimization flags, e.g. -Oz for smaller bundles (default -O2)")
+    build.add_argument("--no-minify", dest="minify", action="store_false", help="keep Spider's names and layout")
+    build.add_argument("--no-optimize-directive", dest="optimize_directive", action="store_false", help="leave out --!optimize 2")
+    build.add_argument("--date", default=datetime.date.today().isoformat(), help="build date written in the header")
     test = commands.add_parser("test", help="run the headless tests")
     test.add_argument("tests", nargs="*", help="only these tests, e.g. api_test")
+    test.add_argument("--only", action="append", default=[], help="only this bundle (repeatable)")
     test.add_argument("--luau", help="path to the Luau CLI")
     bench = commands.add_parser("bench", help="measure frame time")
-    bench.add_argument("--bundle", action="append", default=[], help="bundle to measure (repeat to compare)")
+    bench.add_argument("--bundle", action="append", default=[], help="bundle to measure (repeat to compare; default dist/imgui_debug.luau)")
     bench.add_argument("--rounds", type=int, default=2)
     bench.add_argument("--luau-opt", default="-O2", help="Luau optimization level, -O1 or -O2")
     bench.add_argument("--luau", help="path to the Luau CLI")
@@ -449,8 +500,8 @@ def main() -> int:
     args = parser.parse_args(argv)
 
     handlers = {
-        "setup": command_setup, "all": command_build, "full": command_build, "lite": command_build,
-        "test": command_test, "bench": command_bench, "toolchain": command_toolchain, "clean": command_clean,
+        "setup": command_setup, "build": command_build, "test": command_test, "bench": command_bench,
+        "toolchain": command_toolchain, "clean": command_clean,
     }
     try:
         return handlers[args.command](args)

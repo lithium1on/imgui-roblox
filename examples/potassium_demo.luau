@@ -1,8 +1,8 @@
 -- Dear ImGui through Potassium: DrawingImmediate renders it, UserInputService drives it.
--- Put dist/imgui_roblox.luau in Potassium's workspace folder (or host it and use game:HttpGet), then execute this.
 -- Other executors: use RenderMode = "Drawing" (Drawing library).
+-- imgui_debug.luau has the demo window this script opens; imgui.luau is the smaller build without it.
 
-local ImGui = loadstring(readfile("imgui_roblox.luau"))()
+local ImGui = loadstring(game:HttpGet("https://github.com/lithium1on/imgui-roblox/releases/latest/download/imgui_debug.luau"))()
 
 ImGui.Init({
 	RenderMode = "DrawingImmediate",

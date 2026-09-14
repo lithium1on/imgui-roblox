@@ -1,12 +1,14 @@
 # Third-party notices
 
-The bundles built by this project (`imgui_roblox.luau`, `imgui_roblox_lite.luau`) contain code from the projects below.
+The bundles built by this project (`imgui.luau`, `imgui_debug.luau`, `docking.luau`, `docking_debug.luau`) contain code
+from the projects below.
 The project's own code is under the [MIT License](LICENSE).
 
 ## Dear ImGui
 
-Compiled into the bundles, unmodified. <https://github.com/ocornut/imgui> (v1.92.9b), including `imstb_rectpack.h` and
-`imstb_textedit.h` from the same repository.
+Compiled into the bundles, unmodified. <https://github.com/ocornut/imgui>: tag v1.92.9b for `imgui.luau` and
+`imgui_debug.luau`, tag v1.92.9b-docking of the docking branch for `docking.luau` and `docking_debug.luau`, including
+`imstb_rectpack.h` and `imstb_textedit.h` from the same repository.
 
 ```
 The MIT License (MIT)
@@ -46,5 +48,5 @@ See <https://github.com/emscripten-core/emscripten/blob/main/LICENSE>.
 
 ## dear_bindings
 
-Build-time only: its metadata for Dear ImGui v1.92.9b (MIT, <https://github.com/dearimgui/dear_bindings>) is used to
+Build-time only: its metadata for Dear ImGui v1.92.9b and v1.92.9b-docking (MIT, <https://github.com/dearimgui/dear_bindings>) is used to
 generate the Luau API. No dear_bindings code is included in the bundles.

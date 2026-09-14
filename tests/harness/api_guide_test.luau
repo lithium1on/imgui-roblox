@@ -234,6 +234,21 @@ local snippets = {
 		local mouse = ImGui.GetMousePos()
 		assert(mouse ~= nil and type(ImGui.WantCaptureMouse()) == "boolean")
 	end },
+	{ "docking", function()
+		if not ImGui.HasDocking then
+			return
+		end
+		local dockspace = ImGui.DockSpaceOverViewport(0, nil, ImGui.DockNodeFlags.PassthruCentralNode)
+		ImGui.SetNextWindowDockID(dockspace, ImGui.Cond.FirstUseEver)
+		if ImGui.Begin("Players") then
+			ImGui.Text("docked: %s", tostring(ImGui.IsWindowDocked()))
+		end
+		assert(type(ImGui.GetWindowDockID()) == "number")
+		ImGui.End()
+		ImGui.Begin("Dock host")
+		ImGui.DockSpace(ImGui.GetID("MyDockspace"), Vector2.new(0, 0))
+		ImGui.End()
+	end },
 	{ "saving window layout", function()
 		local ini = ImGui.SaveIniSettings()
 		assert(type(ini) == "string")
