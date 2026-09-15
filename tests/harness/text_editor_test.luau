@@ -1,7 +1,9 @@
--- ImGui.TextEditor (ImGuiColorTextEdit): text in and out (UTF-8), languages, options, palette colors, cursors and
--- selections, find/replace, undo/redo, markers and squiggles; rendering in a window draws the code and typed characters
--- reach a focused editor; Destroy and Shutdown free editors.
+-- The IDE addon (ide.luau, ImGuiColorTextEdit) linked into a bundle with ImGui.Init({ Addons = IDE }): Addons checks,
+-- then ImGui.TextEditor: text in and out (UTF-8), languages, options, palette colors, cursors and selections,
+-- find/replace, undo/redo, markers and squiggles; rendering in a window draws the code and typed characters reach a
+-- focused editor; Destroy and Shutdown free editors, and the addon links again after Init.
 local ImGui = ImGuiBundle
+local IDE = ImGuiAddons.ide
 local W, H = 800, 600
 local failures = 0
 
@@ -20,7 +22,21 @@ local options = {
 	end,
 }
 ImGui.Init(options)
+check("without Addons there is no ImGui.TextEditor", ImGui.TextEditor == nil)
+ImGui.Shutdown()
 
+options.Addons = { {} }
+check("a table that is not an addon is refused", not pcall(ImGui.Init, options) and not ImGui.IsInitialized())
+local otherRelease = table.clone(IDE)
+otherRelease.ImGuiVersion = "1.0"
+options.Addons = otherRelease
+check("an addon from another release is refused", not pcall(ImGui.Init, options) and not ImGui.IsInitialized())
+
+options.Addons = IDE
+local linkStart = os.clock()
+ImGui.Init(options)
+print(string.format("Init with the IDE addon: %.3f s", os.clock() - linkStart))
+check("Addons = IDE adds ImGui.TextEditor", ImGui.TextEditor ~= nil and IDE.Name == "IDE")
 check("Languages lists Luau", table.find(ImGui.TextEditor.Languages, "Luau") ~= nil and #ImGui.TextEditor.Colors == 22)
 
 local editor = ImGui.TextEditor.new()

@@ -1,10 +1,11 @@
 -- A Luau script editor with syntax highlighting, undo/redo, find/replace (Ctrl+F) and a Run button:
--- - ImGui.TextEditor is ImGuiColorTextEdit, in imgui_editor.luau, docking_editor.luau and the _debug builds;
+-- - the IDE addon (ide.luau, ImGuiColorTextEdit) loads next to any bundle and adds ImGui.TextEditor;
 -- - it lays text out on a grid of equal-width cells, so the example uses the Monospace font;
 -- - Run compiles the text with loadstring and shows what the chunk returned, or the error.
 
-local ImGui = loadstring(game:HttpGet("https://github.com/lithium1on/imgui-roblox/releases/latest/download/imgui_editor.luau"))()
-ImGui.Init({ Font = "Monospace", FontSize = 14 })
+local IDE = loadstring(game:HttpGet("https://github.com/lithium1on/imgui-roblox/releases/latest/download/ide.luau"))()
+local ImGui = loadstring(game:HttpGet("https://github.com/lithium1on/imgui-roblox/releases/latest/download/imgui.luau"))()
+ImGui.Init({ Font = "Monospace", FontSize = 14, Addons = IDE })
 
 local editor = ImGui.TextEditor.new()
 editor:SetLanguage("Luau")

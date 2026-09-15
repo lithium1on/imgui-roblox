@@ -70,7 +70,6 @@ def main() -> None:
     parser.add_argument("--optimize-directive", action="store_true", help="add --!optimize 2 to the header")
     parser.add_argument("--notice", help="one extra header line, e.g. license notices")
     parser.add_argument("--build-name", default="", help="the bundle's name, which the runtime reports as ImGui.Build")
-    parser.add_argument("--text-editor", action="store_true", help="the WebAssembly module includes the text editor addon")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -97,7 +96,7 @@ def main() -> None:
         "end)()\n",
         "return (function(...)\n",
         read(args.runtime),
-        f"end)(WasmInstantiate, InstallBindings, Renderer, {json.dumps(args.build_name)}, {'true' if args.text_editor else 'false'})\n",
+        f"end)(WasmInstantiate, InstallBindings, Renderer, {json.dumps(args.build_name)})\n",
     ]
     source = "".join(parts)
     leftover = next((m for m in LEXEMES.finditer(source) if m.group("comment") is not None and m.start() >= len(top)), None)

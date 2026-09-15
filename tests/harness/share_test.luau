@@ -1,8 +1,11 @@
 -- Two scripts, each with its own copy of a bundle (ShareBuildA, then ShareBuildB), draw with one Dear ImGui context:
 -- one frame loop, both scripts' windows in the same context, each script with its own theme and font. When bundle B
 -- has more than bundle A, both scripts move to B; when each has something the other lacks, they stay separate.
--- Also: the first script leaving hands the context style to the next, shutting down from frame callbacks, Share = false.
+-- Also: the first script leaving hands the context style to the next, shutting down from frame callbacks, Share = false,
+-- and the IDE addon: its editors move with their script, and a script can link it into a context that lacks it.
 local A, B = ImGuiBundleA, ImGuiBundleB
+local IDE = ImGuiAddons.ide
+local IDEB = table.clone(IDE) -- script B's own copy of ide.luau
 local W, H = 800, 600
 local failures = 0
 
@@ -28,11 +31,10 @@ getgenv = function()
 end
 
 local function features(name)
-	local debug = string.sub(name, -6) == "_debug"
-	return { Docking = string.sub(name, 1, 7) == "docking", Debug = debug, TextEditor = debug or string.sub(name, -7) == "_editor" }
+	return { Docking = string.sub(name, 1, 7) == "docking", Debug = string.sub(name, -6) == "_debug" }
 end
 local function covers(a, b)
-	return (a.Docking or not b.Docking) and (a.Debug or not b.Debug) and (a.TextEditor or not b.TextEditor)
+	return (a.Docking or not b.Docking) and (a.Debug or not b.Debug)
 end
 local expected = if covers(features(ShareBuildA), features(ShareBuildB)) then "join"
 	elseif covers(features(ShareBuildB), features(ShareBuildA)) then "move"
@@ -92,22 +94,17 @@ local function near(a, b)
 	return math.abs(a - b) < 1e-3
 end
 
--- Script A: light theme, 13 px default font, a Plex font added before B arrives, a window pinned at (123, 45)
+-- Script A: light theme, 13 px default font, a Plex font and a text editor made before B arrives, a window at (123, 45)
 local seenA = { frames = 0 }
 local pinned = true
-A.Init(options({ Theme = "Light", FontSize = 13 }))
+A.Init(options({ Theme = "Light", FontSize = 13, Addons = IDE }))
 local plexA = A.AddFont("Plex", 18)
 A.GetStyle().WindowRounding = 7
-check("HasTextEditor matches the bundle", A.HasTextEditor == features(ShareBuildA).TextEditor)
-local editorA = if A.HasTextEditor then A.TextEditor.new() else nil
-if editorA then
-	editorA:SetText("print('from A')\nreturn 1")
-	editorA:SetLanguage("Luau")
-	editorA:SetTabSize(3)
-	editorA:SetCursor(1, 2)
-else
-	check("TextEditor.new explains which bundles have it", not pcall(A.TextEditor.new))
-end
+local editorA = A.TextEditor.new()
+editorA:SetText("print('from A')\nreturn 1")
+editorA:SetLanguage("Luau")
+editorA:SetTabSize(3)
+editorA:SetCursor(1, 2)
 local callbackA = function(ImGui)
 	seenA.frames += 1
 	if pinned then
@@ -124,7 +121,7 @@ local callbackA = function(ImGui)
 	ImGui.PushFont(plexA, 18)
 	seenA.plexSize = ImGui.GetFontSize()
 	ImGui.PopFont()
-	if editorA and editorA:IsValid() then
+	if editorA:IsValid() then
 		editorA:Render("##editorA", Vector2.new(220, 80))
 	end
 	ImGui.End()
@@ -135,10 +132,12 @@ frame()
 check("A alone: its frame loop draws", seenA.frames == 2 and drawnText("from script A"))
 pinned = false
 
--- Script B: dark theme, 16 px Monospace
+-- Script B: dark theme, 16 px Monospace, its own copy of the IDE addon and an editor
 local seenB = { frames = 0 }
 local warningsBefore = warnings
-B.Init(options({ Theme = "Dark", FontSize = 16, Font = "Monospace" }))
+B.Init(options({ Theme = "Dark", FontSize = 16, Font = "Monospace", Addons = IDEB }))
+local editorB = B.TextEditor.new()
+editorB:SetText("from B")
 local callbackB = function(ImGui)
 	seenB.frames += 1
 	ImGui.SetNextWindowPos(Vector2.new(400, 300), ImGui.Cond.FirstUseEver)
@@ -146,6 +145,9 @@ local callbackB = function(ImGui)
 	ImGui.Text("from script B")
 	seenB.windowBg = ImGui.GetStyle().Colors[ImGui.Col.WindowBg][1]
 	seenB.fontSize = ImGui.GetFontSize()
+	if editorB:IsValid() then
+		editorB:Render("##editorB", Vector2.new(220, 80))
+	end
 	ImGui.End()
 end
 B.OnFrame(callbackB)
@@ -163,11 +165,10 @@ check("each script keeps its font size", near(seenA.fontSize, 13) and near(seenB
 check("style edits made before B arrived are kept", near(seenA.rounding, 7) and near(A.GetStyle().WindowRounding, 7))
 check("A's added font still works", near(seenA.plexSize, 18))
 check("both windows are drawn", drawnText("from script A") and drawnText("from script B"))
-if editorA then
-	local editorLine, editorIndex = editorA:GetMainCursorPosition()
-	check("A's text editor keeps its text, settings and cursor", editorA:IsValid() and editorA:GetText() == "print('from A')\nreturn 1"
-		and editorA:GetTabSize() == 3 and editorA:GetLanguageName() == "Luau" and editorLine == 1 and editorIndex == 2)
-end
+local editorLine, editorIndex = editorA:GetMainCursorPosition()
+check("A's text editor keeps its text, settings and cursor", editorA:IsValid() and editorA:GetText() == "print('from A')\nreturn 1"
+	and editorA:GetTabSize() == 3 and editorA:GetLanguageName() == "Luau" and editorLine == 1 and editorIndex == 2)
+check("B's text editor works", editorB:IsValid() and editorB:GetText() == "from B")
 
 if expected == "separate" then
 	check("separate: two frame loops", #paintCallbacks == 2)
@@ -176,6 +177,7 @@ if expected == "separate" then
 	A.Shutdown()
 	B.Shutdown()
 	check("separate: both shut down", not A.IsInitialized() and not B.IsInitialized() and #paintCallbacks == 0)
+	check("separate: the editors are freed", not editorA:IsValid() and not editorB:IsValid())
 	realPrint(string.format("RESULT %d failure(s)", failures))
 	return
 end
@@ -198,7 +200,7 @@ A.Shutdown()
 seenA.frames, seenB.frames = 0, 0
 frame()
 check("A left: only B's callbacks run", seenA.frames == 0 and seenB.frames == 1 and not A.IsInitialized())
-check("A left: its text editor is freed", editorA == nil or not editorA:IsValid())
+check("A left: its text editor is freed, B's is not", not editorA:IsValid() and editorB:IsValid())
 check("A left: B keeps its theme and font", seenB.windowBg < 0.5 and near(seenB.fontSize, 16))
 check("A left: B shares with nobody", B.GetShareInfo().Scripts == 1 and #paintCallbacks == 1)
 
@@ -208,6 +210,7 @@ plexA = A.AddFont("Plex", 18)
 A.OnFrame(callbackA)
 frame()
 check("A back: both styles again", seenA.windowBg > 0.5 and seenB.windowBg < 0.5 and A.GetShareInfo().Scripts == 2)
+check("A back without Addons: no ImGui.TextEditor", A.TextEditor == nil)
 A.OnFrame(function(ImGui)
 	ImGui.Shutdown()
 end)
@@ -219,6 +222,25 @@ warningsBefore = warnings
 frame()
 check(string.format("shutting both down from callbacks: no warnings (%d)", warnings - warningsBefore), warnings == warningsBefore)
 check("shutting both down: everything stops", not A.IsInitialized() and not B.IsInitialized() and #paintCallbacks == 0)
+check("shutting both down: editors are freed", not editorB:IsValid())
+
+-- A context without the addon: B links it in
+A.Init(options({}))
+B.Init(options({ Addons = IDEB }))
+local lateEditor = B.TextEditor.new()
+lateEditor:SetText("linked later")
+local rendered = false
+B.OnFrame(function(ImGui)
+	ImGui.Begin("Late editor")
+	lateEditor:Render("##late", Vector2.new(200, 60))
+	rendered = true
+	ImGui.End()
+end)
+frame()
+check("B links the addon into A's context", A.TextEditor == nil and rendered and lateEditor:GetText() == "linked later"
+	and B.GetShareInfo().Scripts == 2)
+A.Shutdown()
+B.Shutdown()
 
 -- Share = false: two contexts
 A.Init(options({ Share = false }))

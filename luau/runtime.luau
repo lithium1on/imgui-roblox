@@ -1,9 +1,9 @@
 -- Dear ImGui for Roblox: runtime
 -- Glue between the Luau translation of Dear ImGui (C++ -> WebAssembly with Emscripten -> Luau with Spider),
 -- the render modes in renderer.luau (DrawingImmediate, Drawing) and UserInputService.
--- The bundle calls this chunk with (WasmInstantiate, InstallBindings, Renderer, bundle name, has the text editor addon).
+-- The bundle calls this chunk with (WasmInstantiate, InstallBindings, Renderer, bundle name).
 
-local WasmInstantiate, InstallBindings, Renderer, BuildName, HasTextEditor = ...
+local WasmInstantiate, InstallBindings, Renderer, BuildName = ...
 
 local band, bor, rshift, lshift = bit32.band, bit32.bor, bit32.rshift, bit32.lshift
 local readu8, readu16, readu32, readi32 = buffer.readu8, buffer.readu16, buffer.readu32, buffer.readi32
@@ -511,6 +511,9 @@ local function BuildImports(options, measureGlyph)
 	env.clock_now = Closure(function()
 		return clock()
 	end)
+	env._abort_js = Closure(function()
+		error("[ImGui] WebAssembly code called abort()")
+	end)
 
 	local pendingOutput = ""
 	local wasi = MissingImportTable("wasi_snapshot_preview1", 52) -- ENOSYS
@@ -1014,15 +1017,8 @@ local RequiredExports = {
 	"rbx_discard_font_bakes", "rbx_style_new", "rbx_style_free", "rbx_style_swap", "rbx_script_begin", "rbx_script_end",
 }
 
-local TE = {} -- text editor addon exports without their "rbx_te_" prefix; empty in bundles built without the addon
-local EditorExports = {
-	"rbx_te_new", "rbx_te_free", "rbx_te_render", "rbx_te_take_changed", "rbx_te_buffer_size", "rbx_te_set_text",
-	"rbx_te_get_text", "rbx_te_get_line_text", "rbx_te_get_cursor_text", "rbx_te_get_language_name", "rbx_te_get_section_text",
-	"rbx_te_replace_section_text", "rbx_te_set_language", "rbx_te_set_palette", "rbx_te_set_palette_color",
-	"rbx_te_get_palette_color", "rbx_te_set_option", "rbx_te_get_option", "rbx_te_command", "rbx_te_query", "rbx_te_line",
-	"rbx_te_region", "rbx_te_cursor", "rbx_te_mouse", "rbx_te_get_word_at_mouse_pos", "rbx_te_find", "rbx_te_string",
-	"rbx_te_add_marker", "rbx_te_add_squiggle",
-}
+local HostImports = nil -- the imports the context's module was instantiated with; addon modules get them too
+local LoadedAddons = {} -- addon name -> { Addon, Hooks }: the addons linked into this context
 
 local function GetDisplaySize()
 	local size = Options.DisplaySize
@@ -1138,7 +1134,8 @@ local function StartContext(options)
 		Options = options
 		local measureGlyph, textMetrics = Renderer.CreateGlyphMeasurer(mode, options, FontSlots)
 		TextMetrics = textMetrics
-		Exports = WasmInstantiate(BuildImports(options, measureGlyph))
+		HostImports = BuildImports(options, measureGlyph)
+		Exports = WasmInstantiate(HostImports)
 		MemoryBox = Exports.memory
 		for _, name in RequiredExports do
 			local closure = Exports[name]
@@ -1146,16 +1143,6 @@ local function StartContext(options)
 				error("[ImGui] missing WebAssembly export: " .. name)
 			end
 			F[name] = closure
-		end
-		tclear(TE)
-		if Exports.rbx_te_new ~= nil then
-			for _, name in EditorExports do
-				local closure = Exports[name]
-				if closure == nil then
-					error("[ImGui] missing WebAssembly export: " .. name)
-				end
-				TE[ssub(name, 8)] = closure
-			end
 		end
 
 		F._initialize[1](F._initialize)
@@ -1245,13 +1232,11 @@ local function StopContext()
 	for _, script in Scripts do
 		if script.Instance == Instance then
 			script.Instance = nil
-			for editor in script.Editors do
-				editor.__instance = nil -- its memory goes with the context
-			end
-			tclear(script.Editors)
 		end
 	end
 	tclear(Scripts)
+	tclear(LoadedAddons) -- their objects live in the context's memory
+	HostImports = nil
 	if Group ~= nil and Group.Host == Instance then
 		Group.Host = nil
 	end
@@ -1323,457 +1308,157 @@ local function AddFontToContext(font, sizePixels, mergeMode)
 end
 
 --------------------------------------------------------------------------------
--- Text editor addon: ImGuiColorTextEdit (github.com/goossens/ImGuiColorTextEdit, MIT)
+-- Addons
 --------------------------------------------------------------------------------
--- ImGui.TextEditor.new() creates a code editor (syntax highlighting, undo/redo, find/replace, multiple cursors) and
--- editor:Render(title, size) draws it in the current window. Methods keep TextEditor's names, with zero-based lines and
--- indexes. An editor belongs to the script that created it: editor:Destroy() or the script's ImGui.Shutdown() frees
--- it, and when the script moves to another bundle, the editor's text, cursor and settings move along.
+-- ImGui.Init({ Addons = IDE }) takes what an addon file such as ide.luau returns: { Name, Protocol, ImGuiVersion,
+-- Modules, Install }. Modules holds a WebAssembly side module per Dear ImGui branch, built position-independent. It is
+-- linked into the context's module like a shared library: same memory, function table and stack, with Dear ImGui
+-- called through the module's exports (build.py exports what the addons import). Install(host) returns the hooks the
+-- runtime calls per script: Bind(script) gives the fields added to the script's ImGui table, Leave(script) frees what
+-- the script created, and Snapshot(script) / Restore(script, data) carry that to another bundle's context.
 
-local EditorLanguages = { "C", "Cpp", "Cs", "AngelScript", "Lua", "Luau", "Python", "Glsl", "Hlsl", "Json", "Markdown", "Sql" }
-local EditorColors = {
-	"Text", "Keyword", "Declaration", "Number", "String", "Punctuation", "Preprocessor", "Identifier", "KnownIdentifier",
-	"Comment", "Background", "Cursor", "Selection", "Whitespace", "MatchingBracketBackground", "MatchingBracketActive",
-	"MatchingBracketLevel1", "MatchingBracketLevel2", "MatchingBracketLevel3", "MatchingBracketError", "LineNumber",
-	"CurrentLineNumber",
-}
--- { setter, getter, value is a flag }, in rbx_te_set_option order
-local EditorOptions = {
-	{ "SetTabSize", "GetTabSize" }, { "SetInsertSpacesOnTabs", "IsInsertSpacesOnTabs", true },
-	{ "SetLineSpacing", "GetLineSpacing" }, { "SetWordWrapEnabled", "IsWordWrapEnabled", true },
-	{ "SetReadOnlyEnabled", "IsReadOnlyEnabled", true }, { "SetCaretsVisible", "IsCaretsVisible", true },
-	{ "SetAutoIndentEnabled", "IsAutoIndentEnabled", true }, { "SetShowWhitespacesEnabled", "IsShowWhitespacesEnabled", true },
-	{ "SetShowSpacesEnabled", "IsShowSpacesEnabled", true }, { "SetShowTabsEnabled", "IsShowTabsEnabled", true },
-	{ "SetShowLineNumbersEnabled", "IsShowLineNumbersEnabled", true }, { "SetShowMiniMapEnabled", "IsShowMiniMapEnabled", true },
-	{ "SetMiniMapColumns", "GetMiniMapColumns" }, { "SetShowScrollbarMiniMapEnabled", "IsShowScrollbarMiniMapEnabled", true },
-	{ "SetShowPanScrollIndicatorEnabled", "IsShowPanScrollIndicatorEnabled", true },
-	{ "SetShowMatchingBrackets", "IsShowingMatchingBrackets", true }, { "SetCompletePairedGlyphs", "IsCompletingPairedGlyphs", true },
-	{ "SetLineFoldingEnabled", "IsLineFoldingEnabled", true }, { "SetOverwriteEnabled", "IsOverwriteEnabled", true },
-	{ false, "IsMiddleMousePanMode", true }, { "SetLineNumberLeftMargin", "GetLineNumberLeftMargin" },
-	{ "SetDecorationLeftMargin", "GetDecorationLeftMargin" }, { "SetTextLeftMargin", "GetTextLeftMargin" },
-}
--- In rbx_te_command order
-local EditorCommands = {
-	"Cut", "Copy", "Paste", "Undo", "Redo", "SelectAll", "ClearCursors", "SetFocus", "ClearText", "OpenFindReplaceWindow",
-	"CloseFindReplaceWindow", "FindNext", "FindAll", "ClearMarkers", "ClearSquiggles", "GrowSelections", "ShrinkSelections",
-	"IndentLines", "DeindentLines", "MoveUpLines", "MoveDownLines", "ToggleComments", "SelectionToLowerCase",
-	"SelectionToUpperCase", "StripTrailingWhitespaces", "TabsToSpaces", "SpacesToTabs", "UnfoldAll",
-}
--- { name, result is a flag }, in rbx_te_query order
-local EditorQueries = {
-	{ "CanUndo", true }, { "CanRedo", true }, { "GetUndoIndex" }, { "IsEmpty", true }, { "GetLineCount" },
-	{ "GetNumberOfCursors" }, { "AnyCursorHasSelection", true }, { "AllCursorsHaveSelection", true },
-	{ "MainCursorHasSelection", true }, { "CurrentCursorHasSelection", true }, { "HasMarkers", true },
-	{ "HasSquiggles", true }, { "HasFindString", true }, { "GetFirstVisibleRow" }, { "GetLastVisibleRow" },
-	{ "GetFirstVisibleColumn" }, { "GetLastVisibleColumn" }, { "GetLineHeight" }, { "GetGlyphWidth" }, { "HasLanguage", true },
-}
-local EditorColorIndex = {}
-for index, name in EditorColors do
-	EditorColorIndex[name] = index - 1
-end
-local ScrollAlignments = { Top = 0, Middle = 1, Bottom = 2 }
+local ADDON_PROTOCOL = 1
 
-local EditorMethods = {}
-local EditorMeta = {
-	__index = EditorMethods,
-	__tostring = function(self)
-		return sformat("TextEditor: 0x%08x", self.__ptr)
-	end,
-}
-
-local function EditorCall(name, ...)
-	local closure = TE[name]
-	return closure[1](closure, ...)
-end
-
-local function EditorAlive(editor)
-	return editor.__instance == Instance and editor.__generation == Generation and Initialized
-end
-
-local function EditorPtr(editor)
-	if not EditorAlive(editor) then
-		error("[ImGui] this TextEditor was destroyed, by editor:Destroy() or by ImGui.Shutdown()", 3)
+local function AddonList(value, level)
+	if value == nil then
+		return {}
 	end
-	return editor.__ptr
-end
-
--- Calls fn(pointer, size) with `text` copied into linear memory, NUL-terminated
-local function WithText(text, fn)
-	text = if text == nil then "" else tostring(text)
-	local size = #text
-	local ptr = (F.malloc[1](F.malloc, size + 1))
-	local mem = Mem()
-	writestring(mem, ptr, text)
-	writeu8(mem, ptr + size, 0)
-	local result = fn(ptr, size)
-	F.free[1](F.free, ptr)
-	return result
-end
-
-local function EditorString(ptr, resultPtr)
-	return readstring(Mem(), resultPtr, (EditorCall("buffer_size", ptr)))
-end
-
-local function EditorPositions(resultPtr)
-	local mem = Mem()
-	return readi32(mem, resultPtr), readi32(mem, resultPtr + 4), readi32(mem, resultPtr + 8), readi32(mem, resultPtr + 12)
-end
-
--- An ImU32 (ImGui.COL32), or a Color3 with an optional alpha
-local function ColorU32(color, alpha)
-	if color == nil then
-		return 0
-	elseif type(color) == "number" then
-		return color % 4294967296
+	local usage = "[ImGui] Addons must be an addon, such as what ide.luau returns, or a list of addons"
+	local list = if type(value) == "table" and value.Install ~= nil then { value } else value
+	if type(list) ~= "table" then
+		error(usage, level + 1)
 	end
-	local a = if alpha == nil then 1 else alpha
-	return Raw.COL32(floor(color.R * 255 + 0.5), floor(color.G * 255 + 0.5), floor(color.B * 255 + 0.5), floor(a * 255 + 0.5))
-end
-
-local function CreateEditor(script)
-	if TE.new == nil then
-		error("[ImGui] ImGui.TextEditor needs a bundle with the text editor: imgui_editor.luau, docking_editor.luau or a _debug build", 4)
-	end
-	local editor = setmetatable({
-		__ptr = (EditorCall("new")), __instance = Instance, __generation = Generation, __script = script,
-		__settings = { Options = {}, Colors = {}, Labels = {} },
-	}, EditorMeta)
-	script.Editors[editor] = true
-	return editor
-end
-
-local function DestroyEditor(editor)
-	if EditorAlive(editor) then
-		EditorCall("free", editor.__ptr)
-	end
-	editor.__instance = nil
-	if editor.__script ~= nil then
-		editor.__script.Editors[editor] = nil
-	end
-end
-
-local function SnapshotEditor(editor)
-	if not EditorAlive(editor) then
-		return false
-	end
-	local ptr = editor.__ptr
-	local line, index = EditorPositions((EditorCall("cursor", ptr, 1, 0)))
-	return { Text = EditorString(ptr, (EditorCall("get_text", ptr))), Line = line, Index = index }
-end
-
--- Recreates an editor of another bundle in this bundle's context, with its settings, text and cursor
-local function RestoreEditor(editor, snapshot)
-	if not snapshot or TE.new == nil then
-		editor.__instance = nil
-		return
-	end
-	local ptr = (EditorCall("new"))
-	editor.__ptr, editor.__instance, editor.__generation = ptr, Instance, Generation
-	setmetatable(editor, EditorMeta)
-	local settings = editor.__settings
-	if settings.Language ~= nil then
-		EditorCall("set_language", ptr, settings.Language)
-	end
-	if settings.Palette ~= nil then
-		EditorCall("set_palette", ptr, if settings.Palette == "Light" then 1 else 0)
-	end
-	for index, color in settings.Colors do
-		EditorCall("set_palette_color", ptr, index, color)
-	end
-	for id, value in settings.Options do
-		EditorCall("set_option", ptr, id, value)
-	end
-	for op, text in settings.Labels do
-		WithText(text, function(textPtr, size)
-			EditorCall("string", ptr, op, textPtr, size)
-		end)
-	end
-	WithText(snapshot.Text, function(textPtr, size)
-		EditorCall("set_text", ptr, textPtr, size)
-	end)
-	EditorCall("region", ptr, 0, snapshot.Line, snapshot.Index, 0, 0)
-end
-
-function EditorMethods.Destroy(self)
-	DestroyEditor(self)
-end
-
-function EditorMethods.IsValid(self)
-	return EditorAlive(self)
-end
-
--- size: Vector2, zero or missing components fill the window. Returns whether the editor has keyboard focus.
-function EditorMethods.Render(self, title, size, childFlags, windowFlags)
-	local ptr = EditorPtr(self)
-	local width, height = 0, 0
-	if size ~= nil then
-		width, height = size.X, size.Y
-	end
-	return WithText(title, function(titlePtr)
-		return EditorCall("render", ptr, titlePtr, width, height, childFlags or 0, windowFlags or -1) ~= 0
-	end)
-end
-
--- True once after the text changed (typing, undo, SetText...); the change is seen by Render
-function EditorMethods.IsTextChanged(self)
-	return EditorCall("take_changed", EditorPtr(self)) ~= 0
-end
-
-function EditorMethods.SetText(self, text)
-	local ptr = EditorPtr(self)
-	WithText(text, function(textPtr, size)
-		EditorCall("set_text", ptr, textPtr, size)
-	end)
-end
-
-function EditorMethods.GetText(self)
-	local ptr = EditorPtr(self)
-	return EditorString(ptr, (EditorCall("get_text", ptr)))
-end
-
-function EditorMethods.GetLineText(self, line)
-	local ptr = EditorPtr(self)
-	return EditorString(ptr, (EditorCall("get_line_text", ptr, line)))
-end
-
-function EditorMethods.GetCursorText(self, cursor)
-	local ptr = EditorPtr(self)
-	return EditorString(ptr, (EditorCall("get_cursor_text", ptr, cursor or 0)))
-end
-
-function EditorMethods.GetSectionText(self, startLine, startIndex, endLine, endIndex)
-	local ptr = EditorPtr(self)
-	return EditorString(ptr, (EditorCall("get_section_text", ptr, startLine, startIndex, endLine, endIndex)))
-end
-
-function EditorMethods.ReplaceSectionText(self, startLine, startIndex, endLine, endIndex, text)
-	local ptr = EditorPtr(self)
-	WithText(text, function(textPtr, size)
-		EditorCall("replace_section_text", ptr, startLine, startIndex, endLine, endIndex, textPtr, size)
-	end)
-end
-
--- name: one of ImGui.TextEditor.Languages, or nil for plain text
-function EditorMethods.SetLanguage(self, name)
-	local ptr = EditorPtr(self)
-	local id = if name == nil or name == "None" then 0 else table.find(EditorLanguages, name)
-	if id == nil then
-		error(sformat('[ImGui] unknown TextEditor language "%s" (expected None, %s)', tostring(name), tconcat(EditorLanguages, ", ")), 2)
-	end
-	self.__settings.Language = id
-	EditorCall("set_language", ptr, id)
-end
-
-function EditorMethods.GetLanguageName(self)
-	local ptr = EditorPtr(self)
-	return EditorString(ptr, (EditorCall("get_language_name", ptr)))
-end
-
--- "Dark" (the default) or "Light"; resets colors set with SetPaletteColor
-function EditorMethods.SetPalette(self, name)
-	local ptr = EditorPtr(self)
-	if name ~= "Dark" and name ~= "Light" then
-		error('[ImGui] TextEditor palettes are "Dark" and "Light"', 2)
-	end
-	self.__settings.Palette = name
-	tclear(self.__settings.Colors)
-	EditorCall("set_palette", ptr, if name == "Light" then 1 else 0)
-end
-
-local function PaletteIndex(color)
-	local index = if type(color) == "number" then color else EditorColorIndex[color]
-	if index == nil or index < 0 or index >= #EditorColors then
-		error(sformat('[ImGui] unknown TextEditor palette color "%s" (see ImGui.TextEditor.Colors)', tostring(color)), 3)
-	end
-	return index
-end
-
--- color: a name from ImGui.TextEditor.Colors; value: an ImU32 (ImGui.COL32) or a Color3 with an optional alpha
-function EditorMethods.SetPaletteColor(self, color, value, alpha)
-	local ptr = EditorPtr(self)
-	local index, u32 = PaletteIndex(color), ColorU32(value, alpha)
-	self.__settings.Colors[index] = u32
-	EditorCall("set_palette_color", ptr, index, u32)
-end
-
-function EditorMethods.GetPaletteColor(self, color)
-	return (EditorCall("get_palette_color", EditorPtr(self), PaletteIndex(color))) % 4294967296
-end
-
-for index, option in EditorOptions do
-	local id, setter, getter, flag = index - 1, option[1], option[2], option[3]
-	if setter then
-		EditorMethods[setter] = function(self, value)
-			local ptr = EditorPtr(self)
-			local number = if flag then (if value then 1 else 0) else tonumber(value) or 0
-			self.__settings.Options[id] = number
-			EditorCall("set_option", ptr, id, number)
+	for _, addon in list do
+		if type(addon) ~= "table" or type(addon.Install) ~= "function" or type(addon.Name) ~= "string" or type(addon.Modules) ~= "table" then
+			error(usage, level + 1)
+		elseif addon.Protocol ~= ADDON_PROTOCOL or addon.ImGuiVersion ~= ImGui.Version then
+			error(sformat("[ImGui] the %s addon is from another release (Dear ImGui %s): use the one released with this bundle",
+				addon.Name, tostring(addon.ImGuiVersion)), level + 1)
 		end
 	end
-	EditorMethods[getter] = function(self)
-		local value = EditorCall("get_option", EditorPtr(self), id)
-		if flag then
-			return value ~= 0
+	return list
+end
+
+-- Links a side module into the context's module and returns its exports
+local function LinkModule(module)
+	local memalign, functionTable, stackPointer = Exports.memalign, Exports.__indirect_function_table, Exports.__stack_pointer
+	if memalign == nil or functionTable == nil or stackPointer == nil then
+		error("[ImGui] this bundle cannot load addons")
+	end
+	local memoryBase = 0
+	if module.MemorySize > 0 then
+		memoryBase = (memalign[1](memalign, max(2 ^ module.MemoryAlign, 8), module.MemorySize))
+		buffer.fill(Mem(), memoryBase, 0, module.MemorySize)
+	end
+	local tableBase = functionTable.minimum
+	if tableBase + module.TableSize > functionTable.maximum then
+		error("[ImGui] the function table cannot grow to link an addon")
+	end
+	functionTable.minimum = tableBase + module.TableSize
+
+	local function AddFunction(closure)
+		local index = functionTable.minimum
+		functionTable[index] = closure
+		functionTable.minimum = index + 1
+		return index
+	end
+
+	local own = nil -- the module's exports, once instantiated
+	local late = {} -- GOT entries of the module's own symbols: { box, name, is a function }
+	local function GotSpace(isFunction)
+		return setmetatable({}, {
+			__index = function(space, name)
+				local box, export = { 0 }, Exports[name]
+				if export == nil then
+					table.insert(late, { box, name, isFunction })
+				elseif isFunction then
+					box[1] = AddFunction(export)
+				else
+					box[1] = export[1]
+				end
+				rawset(space, name, box)
+				return box
+			end,
+		})
+	end
+	local hostEnv = HostImports.env
+	local env = setmetatable({
+		memory = Exports.memory,
+		__indirect_function_table = functionTable,
+		__stack_pointer = stackPointer,
+		__memory_base = { memoryBase },
+		__table_base = { tableBase },
+	}, {
+		__index = function(space, name)
+			local value = Exports[name]
+			if value == nil then
+				-- The module's own weak definitions (libc++'s) stay imports; anything else is the runtime's
+				local target = nil
+				value = {
+					function(_, ...)
+						if target == nil then
+							target = if own ~= nil and own[name] ~= nil then own[name] else hostEnv[name]
+						end
+						return target[1](target, ...)
+					end,
+				}
+			end
+			rawset(space, name, value)
+			return value
+		end,
+	})
+	own = module.Instantiate({
+		env = env,
+		wasi_snapshot_preview1 = HostImports.wasi_snapshot_preview1,
+		["GOT.mem"] = GotSpace(false),
+		["GOT.func"] = GotSpace(true),
+	})
+	for _, entry in late do
+		local box, name, isFunction = entry[1], entry[2], entry[3]
+		local export = own[name]
+		if export == nil then
+			error("[ImGui] an addon uses a symbol nothing defines: " .. name)
 		end
-		return value
+		box[1] = if isFunction then AddFunction(export) else memoryBase + export[1]
 	end
-end
-
-for value, name in { [0] = "SetMiddleMouseScrollMode", [1] = "SetMiddleMousePanMode" } do
-	EditorMethods[name] = function(self)
-		local ptr = EditorPtr(self)
-		self.__settings.Options[19] = value
-		EditorCall("set_option", ptr, 19, value)
-	end
-end
-
-for index, name in EditorCommands do
-	local id = index - 1
-	EditorMethods[name] = function(self)
-		EditorCall("command", EditorPtr(self), id)
-	end
-end
-
-for index, query in EditorQueries do
-	local id, name, flag = index - 1, query[1], query[2]
-	EditorMethods[name] = function(self)
-		local value = EditorCall("query", EditorPtr(self), id)
-		if flag then
-			return value ~= 0
+	for _, name in { "__wasm_apply_data_relocs", "__wasm_call_ctors" } do
+		local closure = own[name]
+		if closure ~= nil then
+			closure[1](closure)
 		end
-		return value
 	end
+	return own
 end
 
-function EditorMethods.SelectLine(self, line)
-	EditorCall("line", EditorPtr(self), 0, line, 0)
-end
-
-function EditorMethods.SelectLines(self, startLine, endLine)
-	EditorCall("line", EditorPtr(self), 1, startLine, endLine)
-end
-
--- alignment: "Top", "Middle" (the default) or "Bottom"
-function EditorMethods.ScrollToLine(self, line, alignment)
-	EditorCall("line", EditorPtr(self), 2, line, ScrollAlignments[alignment or "Middle"] or 1)
-end
-
-for op, name in { [3] = "FoldAroundLine", [4] = "UnfoldAroundLine", [5] = "ToggleAtLine" } do
-	EditorMethods[name] = function(self, line)
-		EditorCall("line", EditorPtr(self), op, line, 0)
+local function LoadAddon(addon)
+	local loaded = LoadedAddons[addon.Name]
+	if loaded ~= nil then
+		return loaded
 	end
-end
-
-for op, name in { [6] = "IsLineFoldable", [7] = "IsLineFolded", [8] = "IsLineVisible", [9] = "IsLineHidden" } do
-	EditorMethods[name] = function(self, line)
-		return EditorCall("line", EditorPtr(self), op, line, 0) ~= 0
+	local branch = if Features.Docking then "docking" else "master"
+	local module = addon.Modules[branch]
+	if module == nil then
+		error(sformat("[ImGui] the %s addon has no module for Dear ImGui's %s branch", addon.Name, branch))
 	end
-end
-
-function EditorMethods.SelectToBrackets(self, includeBrackets)
-	EditorCall("line", EditorPtr(self), 10, 0, if includeBrackets == false then 0 else 1)
-end
-
-function EditorMethods.AddNextOccurrence(self, wholeWord)
-	EditorCall("line", EditorPtr(self), 11, 0, if wholeWord then 1 else 0)
-end
-
-function EditorMethods.SelectAllOccurrences(self, wholeWord)
-	EditorCall("line", EditorPtr(self), 12, 0, if wholeWord then 1 else 0)
-end
-
-function EditorMethods.SetCursor(self, line, index)
-	EditorCall("region", EditorPtr(self), 0, line, index, 0, 0)
-end
-
-function EditorMethods.SelectRegion(self, startLine, startIndex, endLine, endIndex)
-	EditorCall("region", EditorPtr(self), 1, startLine, startIndex, endLine, endIndex)
-end
-
--- Without arguments, removes every squiggle
-function EditorMethods.ClearSquiggles(self, startLine, startIndex, endLine, endIndex)
-	local ptr = EditorPtr(self)
-	if startLine == nil then
-		EditorCall("command", ptr, 14)
-	else
-		EditorCall("region", ptr, 2, startLine, startIndex, endLine, endIndex)
-	end
-end
-
--- Return line, index
-for which, name in { [0] = "GetCursorPosition", [1] = "GetMainCursorPosition", [2] = "GetCurrentCursorPosition" } do
-	EditorMethods[name] = function(self, cursor)
-		local line, index = EditorPositions((EditorCall("cursor", EditorPtr(self), which, cursor or 0)))
-		return line, index
-	end
-end
-
--- Return startLine, startIndex, endLine, endIndex
-for which, name in { [3] = "GetCursorSelection", [4] = "GetMainCursorSelection", [5] = "GetCurrentCursorSelection" } do
-	EditorMethods[name] = function(self, cursor)
-		return EditorPositions((EditorCall("cursor", EditorPtr(self), which, cursor or 0)))
-	end
-end
-
-function EditorMethods.IsMousePosOverGlyph(self, pos)
-	return EditorCall("mouse", EditorPtr(self), 0, pos.X, pos.Y) ~= 0
-end
-
-function EditorMethods.IsMousePosOverTextArea(self, pos)
-	return EditorCall("mouse", EditorPtr(self), 1, pos.X, pos.Y) ~= 0
-end
-
-function EditorMethods.GetDocPosAtMousePos(self, pos)
-	local line, index = EditorPositions((EditorCall("mouse", EditorPtr(self), 2, pos.X, pos.Y)))
-	return line, index
-end
-
-function EditorMethods.GetWordAtMousePos(self, pos)
-	local ptr = EditorPtr(self)
-	return EditorString(ptr, (EditorCall("get_word_at_mouse_pos", ptr, pos.X, pos.Y)))
-end
-
--- (text, caseSensitive = true, wholeWord = false)
-for op, name in { [0] = "SelectFirstOccurrenceOf", [1] = "SelectNextOccurrenceOf", [2] = "SelectAllOccurrencesOf" } do
-	EditorMethods[name] = function(self, text, caseSensitive, wholeWord)
-		local ptr = EditorPtr(self)
-		WithText(text, function(textPtr, size)
-			EditorCall("find", ptr, op, textPtr, size, if caseSensitive == false then 0 else 1, if wholeWord then 1 else 0)
-		end)
-	end
-end
-
-for op, name in {
-	[0] = "ReplaceTextInCurrentCursor", [1] = "ReplaceTextInAllCursors", [2] = "SetFindButtonLabel",
-	[3] = "SetFindAllButtonLabel", [4] = "SetReplaceButtonLabel", [5] = "SetReplaceAllButtonLabel",
-} do
-	EditorMethods[name] = function(self, text)
-		local ptr = EditorPtr(self)
-		if op >= 2 then
-			self.__settings.Labels[op] = tostring(text)
-		end
-		WithText(text, function(textPtr, size)
-			EditorCall("string", ptr, op, textPtr, size)
-		end)
-	end
-end
-
-function EditorMethods.AddMarker(self, line, lineNumberColor, textColor, lineNumberTooltip, textTooltip)
-	local ptr = EditorPtr(self)
-	local numberColor, lineColor = ColorU32(lineNumberColor), ColorU32(textColor)
-	WithText(lineNumberTooltip, function(numberPtr, numberSize)
-		WithText(textTooltip, function(textPtr, textSize)
-			EditorCall("add_marker", ptr, line, numberColor, lineColor, numberPtr, numberSize, textPtr, textSize)
-		end)
-	end)
-end
-
-function EditorMethods.AddSquiggle(self, startLine, startIndex, endLine, endIndex, kind, color, tooltip)
-	local ptr = EditorPtr(self)
-	local u32 = ColorU32(color)
-	WithText(tooltip, function(textPtr, size)
-		EditorCall("add_squiggle", ptr, startLine, startIndex, endLine, endIndex, kind or 0, u32, textPtr, size)
-	end)
+	local exports = LinkModule(module)
+	local generation = Generation
+	local hooks = addon.Install({
+		Exports = exports,
+		Raw = Raw,
+		Mem = Mem,
+		Malloc = function(size)
+			return (F.malloc[1](F.malloc, size))
+		end,
+		Free = function(ptr)
+			F.free[1](F.free, ptr)
+		end,
+		Alive = function()
+			return Initialized and Generation == generation
+		end,
+	})
+	loaded = { Addon = addon, Hooks = hooks }
+	LoadedAddons[addon.Name] = loaded
+	return loaded
 end
 
 local function RunScript(script, stackPointer)
@@ -1799,8 +1484,10 @@ local function RemoveScript(script)
 	script.Leaving = nil
 	if script.Instance == Instance then
 		script.Instance = nil
-		for editor in table.clone(script.Editors) do
-			DestroyEditor(editor)
+		for _, loaded in LoadedAddons do
+			if loaded.Hooks.Leave ~= nil then
+				loaded.Hooks.Leave(script)
+			end
 		end
 	end
 	if index == nil then
@@ -1871,23 +1558,34 @@ function Instance.Stop()
 	StopContext()
 end
 
-function Instance.NewEditor(script)
-	return CreateEditor(script)
-end
-
-function Instance.SnapshotEditors(script)
-	local snapshots = {}
-	for editor in script.Editors do
-		snapshots[editor] = SnapshotEditor(editor)
+function Instance.AddonFields(script)
+	local fields = {}
+	for _, addon in script.Addons do
+		local loaded = LoadedAddons[addon.Name]
+		if loaded ~= nil and loaded.Hooks.Bind ~= nil then
+			for key, value in loaded.Hooks.Bind(script) do
+				fields[key] = value
+			end
+		end
 	end
-	return snapshots
+	return fields
 end
 
-function Instance.RestoreEditors(script, snapshots)
-	for editor, snapshot in snapshots do
-		RestoreEditor(editor, snapshot)
-		if editor.__instance == nil then
-			script.Editors[editor] = nil
+function Instance.SnapshotAddons(script)
+	local data = {}
+	for name, loaded in LoadedAddons do
+		if loaded.Hooks.Snapshot ~= nil then
+			data[name] = loaded.Hooks.Snapshot(script)
+		end
+	end
+	return data
+end
+
+function Instance.RestoreAddons(script, data)
+	for name, value in data do
+		local loaded = LoadedAddons[name]
+		if loaded ~= nil and loaded.Hooks.Restore ~= nil then
+			loaded.Hooks.Restore(script, value)
 		end
 	end
 end
@@ -1895,6 +1593,9 @@ end
 -- Adds a script. `restore`: style values read from another bundle, used instead of the script's Theme and Scale.
 function Instance.Attach(script, restore)
 	local options = script.Options
+	for _, addon in script.Addons do
+		LoadAddon(addon)
+	end
 	script.Instance = Instance
 	if #Scripts > 0 then
 		script.Style = (F.rbx_style_new[1](F.rbx_style_new))
@@ -1960,11 +1661,10 @@ end
 
 local function Covers(features, needed)
 	return (features.Docking or not needed.Docking) and (features.Debug or not needed.Debug)
-		and (features.TextEditor or not needed.TextEditor)
 end
 
 -- This script's record, and the ImGui functions that belong to the script rather than to the context it draws with
-local Script = { Table = ImGui, Callbacks = {}, Fonts = {}, Editors = {}, Instance = nil, Shared = false }
+local Script = { Table = ImGui, Callbacks = {}, Fonts = {}, Addons = {}, AddonFields = {}, Instance = nil, Shared = false }
 local ScriptFunctions = {}
 local WarnedSeparate = false
 
@@ -1978,17 +1678,23 @@ local function BindScript(script, instance)
 	end
 	target.RenderMode = instance.RenderMode()
 	target.HasDocking = instance.Features.Docking
-	target.HasTextEditor = instance.Features.TextEditor
+	for key in script.AddonFields do
+		target[key] = nil
+	end
+	script.AddonFields = instance.AddonFields(script)
+	for key, value in script.AddonFields do
+		target[key] = value
+	end
 	target.Build = instance.Build
 end
 
 -- Moves the scripts of another bundle's context to this bundle, which has everything that one has
 local function TakeOver(old)
 	local moving = old.Scripts()
-	local styles, editors = {}, {}
+	local styles, addons = {}, {}
 	for index, script in moving do
 		styles[index] = old.ReadStyle(script)
-		editors[index] = old.SnapshotEditors(script)
+		addons[index] = old.SnapshotAddons(script)
 	end
 	local ini = old.SaveIni()
 	StartContext(moving[1].Options)
@@ -1997,7 +1703,7 @@ local function TakeOver(old)
 		for index, script in moving do
 			Instance.Attach(script, styles[index])
 			BindScript(script, Instance)
-			Instance.RestoreEditors(script, editors[index])
+			Instance.RestoreAddons(script, addons[index])
 		end
 	end)
 	if not ok then
@@ -2030,8 +1736,9 @@ function ScriptFunctions.Init(options)
 	if options.Docking == true and not Features.Docking then
 		error("[ImGui] Docking needs a docking build: docking.luau or docking_debug.luau", 2)
 	end
+	local addons = AddonList(options.Addons, 2)
 	local startTime = clock()
-	Script.Options = options
+	Script.Options, Script.Addons = options, addons
 
 	local group = if options.Share ~= false and options.AutoRender ~= false and options.Renderer == nil then ShareGroup() else nil
 	local host = if group ~= nil then group.Host else nil
@@ -2063,7 +1770,13 @@ function ScriptFunctions.Init(options)
 				group.Host, Group = Instance, group
 			end
 		end
-		Instance.Attach(Script)
+		local ok, err = pcall(Instance.Attach, Script)
+		if not ok then
+			if #Scripts == 0 then
+				StopContext()
+			end
+			error(err, 0)
+		end
 		BindScript(Script, Instance)
 	end
 	Script.Shared = Script.Instance ~= Instance or Group ~= nil
@@ -2179,16 +1892,6 @@ for _, name in { "StyleColorsDark", "StyleColorsLight", "StyleColorsClassic" } d
 		return instance.Api()[name](dst or instance.StyleHandle(Script))
 	end
 end
-
--- ImGui.TextEditor.new() creates a text editor (see the text editor addon section); Languages and Colors list the names
--- SetLanguage and SetPaletteColor take
-ScriptFunctions.TextEditor = {
-	new = function()
-		return CurrentInstance(2).NewEditor(Script)
-	end,
-	Languages = table.clone(EditorLanguages),
-	Colors = table.clone(EditorColors),
-}
 
 -- Shared: whether the script shares a context with other scripts. Role: "host" when this script's bundle runs that
 -- context, "client" when another script's bundle does, "private" without sharing. Scripts: how many scripts draw
@@ -2363,12 +2066,9 @@ end
 ImGui.HasDocking = ImGui.ConfigFlags ~= nil and ImGui.ConfigFlags.DockingEnable ~= nil
 -- The bundle's name: "imgui", "imgui_debug", "docking" or "docking_debug"
 ImGui.Build = if BuildName ~= nil and BuildName ~= "" then BuildName else nil
--- True in the bundles with the text editor addon (ImGui.TextEditor): the _editor and _debug builds
-ImGui.HasTextEditor = HasTextEditor == true
 Features = {
 	Docking = ImGui.HasDocking,
 	Debug = if ImGui.Build ~= nil then sfind(ImGui.Build, "_debug$") ~= nil else ImGui.ShowFontSelector ~= nil,
-	TextEditor = ImGui.HasTextEditor,
 }
 Instance.Features = Features
 Instance.Build = ImGui.Build

@@ -11,7 +11,8 @@
 #include <string>
 #include <string_view>
 
-#define RBX_EXPORT extern "C" EMSCRIPTEN_KEEPALIVE
+// Built with -fvisibility=hidden as a side module: only these exports stay visible to the dynamic linker
+#define RBX_EXPORT extern "C" EMSCRIPTEN_KEEPALIVE __attribute__((visibility("default")))
 
 extern "C" {
 // TextEditor times change reports with std::chrono::system_clock: seconds from the host instead of a WASI clock import

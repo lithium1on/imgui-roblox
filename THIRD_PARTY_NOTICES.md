@@ -1,7 +1,7 @@
 # Third-party notices
 
-The bundles built by this project (`imgui.luau`, `imgui_debug.luau`, `docking.luau`, `docking_debug.luau`) contain code
-from the projects below.
+The bundles built by this project (`imgui.luau`, `imgui_debug.luau`, `docking.luau`, `docking_debug.luau`) and its
+addons (`ide.luau`) contain code from the projects below.
 The project's own code is under the [MIT License](LICENSE).
 
 ## Dear ImGui
@@ -36,7 +36,7 @@ SOFTWARE.
 
 ## ImGuiColorTextEdit
 
-The text editor addon (`ImGui.TextEditor`), compiled into the bundles, unmodified. <https://github.com/goossens/ImGuiColorTextEdit>, commit f28136480fa4091164e0b528dc9cca147c5a6ee9.
+The IDE addon (`ide.luau`, `ImGui.TextEditor`), compiled into its WebAssembly modules, unmodified. <https://github.com/goossens/ImGuiColorTextEdit>, commit f28136480fa4091164e0b528dc9cca147c5a6ee9.
 
 ```
 MIT License
@@ -70,7 +70,7 @@ are licensed under the [Mozilla Public License 2.0](https://mozilla.org/MPL/2.0/
 
 ## Emscripten system libraries
 
-Parts of the C and C++ runtime linked into the WebAssembly module by [Emscripten](https://github.com/emscripten-core/emscripten)
+Parts of the C and C++ runtime linked into the WebAssembly modules by [Emscripten](https://github.com/emscripten-core/emscripten)
 6.0.9: musl libc (MIT), libc++, libc++abi and compiler-rt (Apache-2.0 WITH LLVM-exception) and dlmalloc (CC0).
 See <https://github.com/emscripten-core/emscripten/blob/main/LICENSE>.
 

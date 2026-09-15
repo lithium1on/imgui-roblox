@@ -2,8 +2,8 @@
 """Dear ImGui for Roblox: set up the toolchains, build, test and benchmark, on Windows, macOS and Linux.
 
     python build.py setup           download Dear ImGui (master and docking), dear_bindings, ImGuiColorTextEdit, Emscripten, Spider, Luau
-    python build.py                 build every bundle into dist/
-    python build.py docking         build some of them (names below, without .luau)
+    python build.py                 build every bundle and addon into dist/
+    python build.py docking ide     build some of them (names below, without .luau)
     python build.py test            run the headless tests and the examples against every bundle
     python build.py test examples   only run the scripts in examples/ (or: test api_test --only docking)
     python build.py bench           frame time on a demo scene (--bundle, --rounds, --luau-opt)
@@ -11,12 +11,13 @@
     python build.py clean           delete build/ and dist/
 
 Bundles:
-    imgui.luau            Dear ImGui (master branch) without the demo window and debug tools
-    imgui_editor.luau     imgui.luau plus the text editor addon (ImGuiColorTextEdit)
-    imgui_debug.luau      Dear ImGui with the demo window, metrics, debug tools and the text editor
-    docking.luau          Dear ImGui docking branch without the demo window and debug tools
-    docking_editor.luau   docking.luau plus the text editor addon
-    docking_debug.luau    docking branch with the demo window, metrics, debug tools and the text editor
+    imgui.luau           Dear ImGui (master branch) without the demo window and debug tools
+    imgui_debug.luau     Dear ImGui with the demo window, metrics and debug tools
+    docking.luau         Dear ImGui docking branch without the demo window and debug tools
+    docking_debug.luau   docking branch with the demo window, metrics and debug tools
+
+Addons, loaded next to any bundle with ImGui.Init({ Addons = ... }):
+    ide.luau             ImGuiColorTextEdit, a code editor, as ImGui.TextEditor
 
 Requirements: Python 3.9 or newer. The first setup also needs Rust (https://rustup.rs), because Spider is compiled from
 source.
@@ -26,6 +27,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import io
+import json
 import os
 import platform
 import re
@@ -47,6 +49,9 @@ DIST = ROOT / "dist"
 HARNESS = ROOT / "tests" / "harness"
 EXAMPLES = ROOT / "examples"
 
+sys.path.insert(0, str(ROOT / "tools"))
+import wasm_info  # noqa: E402
+
 IMGUI_VERSION = "1.92.9b"
 DEAR_BINDINGS_VERSION = "0.21"
 EMSDK_VERSION = "6.0.9"
@@ -54,7 +59,7 @@ SPIDER_COMMIT = "cfaf2fb7d68988d0183fb65d4182f3a5a1127282"
 LUAU_VERSION = "0.738"
 TEXT_EDITOR_COMMIT = "f28136480fa4091164e0b528dc9cca147c5a6ee9"  # goossens/ImGuiColorTextEdit, made for Dear ImGui 1.92.9
 TEXT_EDITOR = THIRD_PARTY / "ImGuiColorTextEdit"
-NOTICE = "Dear ImGui (c) Omar Cornut and ImGuiColorTextEdit (c) Johan A. Goossens, MIT License; Spider runtime helpers, MPL-2.0"
+NOTICE = "Dear ImGui (c) Omar Cornut, MIT License; Spider runtime helpers, MPL-2.0"
 EXE = ".exe" if os.name == "nt" else ""
 
 BRANCHES = {
@@ -78,13 +83,27 @@ LEAN_CFLAGS = ["-DIMGUI_DISABLE_DEMO_WINDOWS", "-DIMGUI_DISABLE_DEBUG_TOOLS"]
 LEAN_EXCLUDE = ["ImGui_ShowFontSelector", "ImGui_DebugTextEncoding", "ImGui_DebugFlashStyleColor"]
 
 VARIANTS = {
-    "imgui": {"branch": "master", "debug": False, "text_editor": False},
-    "imgui_editor": {"branch": "master", "debug": False, "text_editor": True},
-    "imgui_debug": {"branch": "master", "debug": True, "text_editor": True},
-    "docking": {"branch": "docking", "debug": False, "text_editor": False},
-    "docking_editor": {"branch": "docking", "debug": False, "text_editor": True},
-    "docking_debug": {"branch": "docking", "debug": True, "text_editor": True},
+    "imgui": {"branch": "master", "debug": False},
+    "imgui_debug": {"branch": "master", "debug": True},
+    "docking": {"branch": "docking", "debug": False},
+    "docking_debug": {"branch": "docking", "debug": True},
 }
+
+# An addon is C++ built into a position-independent WebAssembly side module per Dear ImGui branch, plus the Luau that
+# wraps it. The runtime links the module into the running context (see "Addons" in luau/runtime.luau); every bundle
+# exports the Dear ImGui symbols the addons import.
+ADDONS = {
+    "ide": {
+        "sources": [TEXT_EDITOR / "TextEditor.cpp", ROOT / "src" / "addons" / "text_editor.cpp"],
+        "includes": [TEXT_EDITOR],
+        "exports": r"RBX_EXPORT [^(]*?\b(rbx_te_\w+)\(",
+        "luau": ROOT / "luau" / "addons" / "ide.luau",
+        "notice": "ImGuiColorTextEdit (c) Johan A. Goossens, MIT License; Spider runtime helpers, MPL-2.0",
+        "tests": ["text_editor_test"],
+    },
+}
+# Emscripten libraries linked into addon modules; malloc and free come from the bundle
+PIC_LIBRARIES = ["libc++-noexcept", "libc++abi-noexcept", "libc"]
 
 COMMON_TESTS = [
     "api_test", "api_guide_test", "render_modes_test", "init_options_test", "input_test", "shape_detection_test",
@@ -92,15 +111,14 @@ COMMON_TESTS = [
 ]
 DEBUG_TESTS = ["help_section_test", "demo_stress_test"]  # need the demo window
 DOCKING_TESTS = ["docking_test"]
-EDITOR_TESTS = ["text_editor_test"]  # need the text editor addon
 # share_test runs two scripts, each with its own copy of a bundle: a second bundle with nothing new joins the first, one
-# with more takes over (text editors included), and bundles that each lack something the other has stay separate
+# with more takes over (windows, styles, fonts and addon objects included), and bundles that each lack something the
+# other has stay separate
 SHARE_PAIRS = [
     ("imgui", "imgui"), ("imgui_debug", "imgui"), ("imgui", "docking_debug"), ("docking", "imgui"),
-    ("docking", "imgui_debug"), ("docking_debug", "docking_debug"), ("imgui", "imgui_editor"),
-    ("imgui_editor", "docking_debug"), ("docking_editor", "imgui_editor"), ("imgui_editor", "docking"),
+    ("docking", "imgui_debug"), ("docking_debug", "docking_debug"),
 ]
-# The line every example loads its bundle with; the test runs the example against that bundle from dist/
+# The lines examples load bundles and addons with; the test runs the example against those files from dist/
 EXAMPLE_LOAD = re.compile(
     r'loadstring\(game:HttpGet\("https://github\.com/lithium1on/imgui-roblox/releases/latest/download/(\w+)\.luau"\)\)\(\)'
 )
@@ -148,8 +166,6 @@ def tests_for(name: str) -> list[str]:
         tests += DEBUG_TESTS
     if variant["branch"] == "docking":
         tests += DOCKING_TESTS
-    if variant["text_editor"]:
-        tests += EDITOR_TESTS
     return tests
 
 
@@ -181,6 +197,10 @@ def extract_archive(data: bytes, destination: Path) -> None:
 
 def em_tool(name: str) -> Path:
     return TOOLS / "emsdk" / "upstream" / "emscripten" / f"{name}.py"
+
+
+def pic_library(name: str) -> Path:
+    return TOOLS / "emsdk" / "upstream" / "emscripten" / "cache" / "sysroot" / "lib" / "wasm32-emscripten" / "pic" / f"{name}.a"
 
 
 def spider_binary() -> Path:
@@ -245,6 +265,15 @@ def setup_emscripten() -> None:
     run([sys.executable, target / "emsdk.py", "activate", EMSDK_VERSION], cwd=target)
 
 
+def setup_pic_libraries() -> None:
+    missing = [name for name in PIC_LIBRARIES if not pic_library(name).exists()]
+    if not missing:
+        print("   Emscripten libraries for addons are ready")
+        return
+    step("Emscripten's C and C++ libraries for addons (position-independent, a minute)")
+    run([sys.executable, em_tool("embuilder"), "build", *missing, "--pic"], env=emscripten_env())
+
+
 def setup_spider() -> None:
     if spider_binary().exists():
         print(f"   Spider: {relative(spider_binary())} is ready")
@@ -287,6 +316,7 @@ def command_setup(args) -> int:
     setup_dear_bindings()
     setup_text_editor()
     setup_emscripten()
+    setup_pic_libraries()
     setup_spider()
     setup_luau()
     print("Toolchains ready: run python build.py")
@@ -315,7 +345,123 @@ def size(path: Path) -> str:
     return f"{path.stat().st_size / 1e6:.2f} MB"
 
 
-def build_variant(name: str, args) -> None:
+def translate(wasm: Path, out_stem: Path, args) -> Path:
+    """WebAssembly -> Luau with Spider, then the optimizer and (unless --no-minify) the minifier. Returns the Luau file."""
+    tools = ROOT / "tools"
+    step("translating to Luau")
+    raw = out_stem.with_suffix(".luau")
+    with open(raw, "wb") as output:
+        run([spider_binary(), "compile", "-O3", wasm], stdout=output)
+    print(f"   {size(raw)}")
+    step("optimizing Spider's output")
+    result = out_stem.with_suffix(".opt.luau")
+    run([sys.executable, tools / "optimize_luau.py", raw, result])
+    if args.minify:
+        step("minifying")
+        minified = out_stem.with_suffix(".min.luau")
+        run([sys.executable, tools / "minify_luau.py", result, minified])
+        result = minified
+    return result
+
+
+def addon_dir(name: str, branch_key: str) -> Path:
+    return BUILD / "addons" / name / branch_key
+
+
+def addon_module_luau(name: str, branch_key: str, args) -> Path:
+    return addon_dir(name, branch_key) / ("module.min.luau" if args.minify else "module.opt.luau")
+
+
+def build_addon_module(name: str, branch_key: str, args) -> dict:
+    """Builds an addon's side module for one branch (skipped when up to date). Returns its imports, exports and sizes."""
+    addon = ADDONS[name]
+    branch = BRANCHES[branch_key]
+    work = addon_dir(name, branch_key)
+    info_path = work / "module.json"
+    inputs = [
+        *addon["sources"], ROOT / "src" / "rbx_libc.cpp", ROOT / "src" / "rbx_host.h", ROOT / "src" / "imconfig_roblox.h",
+        branch["imgui"] / "imgui.h", branch["imgui"] / "imgui_internal.h", Path(__file__),
+    ]
+    if info_path.exists() and addon_module_luau(name, branch_key, args).exists():
+        built = info_path.stat().st_mtime
+        if all(path.stat().st_mtime <= built for path in inputs):
+            print(f"   {name} module for the {branch_key} branch is up to date", flush=True)
+            return json.loads(read(info_path))
+
+    print(f"=== {name} addon module, {branch_key} branch", flush=True)
+    setup_pic_libraries()
+    work.mkdir(parents=True, exist_ok=True)
+    flags = [
+        "-std=c++17", "-DNDEBUG", "-fno-exceptions", "-fno-rtti", "-Oz",
+        "-fPIC", "-fvisibility=hidden", "-fvisibility-inlines-hidden",
+        f"-I{branch['imgui']}", f"-I{ROOT / 'src'}", *(f"-I{path}" for path in addon["includes"]),
+        '-DIMGUI_USER_CONFIG="imconfig_roblox.h"',
+    ]
+    step("compiling (-Oz, position-independent)")
+    objects = []
+    for source in [*addon["sources"], ROOT / "src" / "rbx_libc.cpp"]:
+        obj = work / f"{source.stem}.o"
+        run([sys.executable, em_tool("em++"), "-c", source, *flags, "-o", obj], env=emscripten_env())
+        objects.append(obj)
+    exports = sorted({symbol for source in addon["sources"] for symbol in re.findall(addon["exports"], read(source))})
+
+    step("linking the side module")
+    wasm = work / "module.wasm"
+    run([
+        sys.executable, em_tool("em++"), *objects, "-Oz", "-sSIDE_MODULE=2", "-Wl,-Bsymbolic",
+        "-sEXPORTED_FUNCTIONS=" + ",".join(f"_{symbol}" for symbol in exports),
+        *(pic_library(library) for library in PIC_LIBRARIES), "-o", wasm,
+    ], env=emscripten_env())
+    print(f"   {size(wasm)}")
+    translate(wasm, work / "module", args)
+
+    module = wasm_info.read_module(wasm)
+    info = {
+        "memory_size": module["memory_size"], "memory_align": module["memory_align"], "table_size": module["table_size"],
+        "imports": [list(entry) for entry in module["imports"]], "exports": [entry[0] for entry in module["exports"]],
+    }
+    info_path.write_text(json.dumps(info, indent=1), encoding="utf-8", newline="\n")
+    return info
+
+
+LINKING_IMPORTS = {"memory", "__indirect_function_table", "__stack_pointer", "__memory_base", "__table_base"}
+
+
+def addon_symbols(info: dict) -> list[str]:
+    """Symbols an addon module expects the bundle to export: Dear ImGui functions and data, malloc, and the like."""
+    own = set(info["exports"])
+    wanted = set()
+    for module, symbol, kind in info["imports"]:
+        if module in ("GOT.mem", "GOT.func") or (module == "env" and kind == "func"):
+            if symbol not in own:
+                wanted.add(symbol)
+    return sorted(wanted)
+
+
+def runtime_host_imports() -> dict[str, set[str]]:
+    """The WebAssembly imports luau/runtime.luau implements, by module."""
+    imports: dict[str, set[str]] = {"env": set(), "wasi_snapshot_preview1": set()}
+    for space, symbol in re.findall(r"\b(env|wasi)\.(\w+)\s*=\s*Closure", read(ROOT / "luau" / "runtime.luau")):
+        imports["env" if space == "env" else "wasi_snapshot_preview1"].add(symbol)
+    return imports
+
+
+def check_addon_imports(name: str, info: dict, bundle_wasm: Path) -> None:
+    exported = {entry[0] for entry in wasm_info.read_module(bundle_wasm)["exports"]}
+    own = set(info["exports"])
+    host = runtime_host_imports()
+    missing = []
+    for module, symbol, _ in info["imports"]:
+        if (module == "env" and symbol in LINKING_IMPORTS) or symbol in exported or symbol in own:
+            continue
+        if symbol in host.get(module, ()):
+            continue
+        missing.append(f"{module}.{symbol}")
+    if missing:
+        raise BuildError(f"the {name} addon imports what this bundle does not provide: {', '.join(missing[:20])}")
+
+
+def build_variant(name: str, args, addon_modules: dict[str, dict]) -> None:
     variant = VARIANTS[name]
     branch = BRANCHES[variant["branch"]]
     build = BUILD / name
@@ -334,44 +480,29 @@ def build_variant(name: str, args) -> None:
         "--out-cpp", gen / "imgui_bindings.cpp", "--out-luau", gen / "bindings.luau", "--exclude", ",".join(excluded),
     ])
 
-    compile_flags = [
-        "-std=c++17", "-DNDEBUG", "-fno-exceptions", "-fno-rtti",
-        f"-I{imgui}", f"-I{ROOT / 'src'}", f"-I{TEXT_EDITOR}", '-DIMGUI_USER_CONFIG="imconfig_roblox.h"', *cflags,
-    ]
+    # What addon modules link against: the stack pointer, a function table they can add to, memalign for their data,
+    # and the symbols they import
+    addon_exports = sorted({symbol for info in addon_modules.values() for symbol in addon_symbols(info)})
+    step(f"compiling to WebAssembly ({args.opt})")
     sources = [ROOT / "src" / file for file in ("imgui_rbx.cpp", "rbx_libc.cpp", "rbx_stbtt_stubs.cpp")]
     sources += [imgui / file for file in ("imgui.cpp", "imgui_draw.cpp", "imgui_widgets.cpp", "imgui_tables.cpp", "imgui_demo.cpp")]
     sources.append(gen / "imgui_bindings.cpp")
-    if variant["text_editor"]:
-        # Compiled for size: the editor is a third of the module at -O2, and its speed matters less than Dear ImGui's
-        step("compiling the text editor addon (-Oz)")
-        for source in (TEXT_EDITOR / "TextEditor.cpp", ROOT / "src" / "addons" / "text_editor.cpp"):
-            obj = build / f"{source.stem}.o"
-            run([sys.executable, em_tool("em++"), "-c", source, *compile_flags, "-Oz", "-o", obj], env=emscripten_env())
-            sources.append(obj)
-
-    step(f"compiling to WebAssembly ({args.opt})")
     run([
-        sys.executable, em_tool("em++"), *sources, *args.opt.split(), *compile_flags,
+        sys.executable, em_tool("em++"), *sources,
+        "-std=c++17", *args.opt.split(), "-DNDEBUG", "-fno-exceptions", "-fno-rtti",
+        f"-I{imgui}", f"-I{ROOT / 'src'}", '-DIMGUI_USER_CONFIG="imconfig_roblox.h"', *cflags,
         "-sSTANDALONE_WASM", "--no-entry",
-        "-sEXPORTED_FUNCTIONS=_malloc,_free,_emscripten_stack_get_current,__emscripten_stack_restore",
+        "-sEXPORTED_FUNCTIONS=_malloc,_free,_memalign,_emscripten_stack_get_current,__emscripten_stack_restore",
         "-sALLOW_MEMORY_GROWTH=1", "-sINITIAL_MEMORY=16777216", "-sSTACK_SIZE=1048576",
         "-sFILESYSTEM=0", "-sSUPPORT_LONGJMP=0",
+        "-Wl,--export=__stack_pointer", "-Wl,--growable-table", *(f"-Wl,--export-if-defined={symbol}" for symbol in addon_exports),
         "-o", build / "imgui.wasm",
     ], env=emscripten_env())
     print(f"   {size(build / 'imgui.wasm')}")
+    for addon_name, info in addon_modules.items():
+        check_addon_imports(addon_name, info, build / "imgui.wasm")
 
-    step("translating to Luau")
-    with open(build / "imgui_wasm.luau", "wb") as output:
-        run([spider_binary(), "compile", "-O3", build / "imgui.wasm"], stdout=output)
-    print(f"   {size(build / 'imgui_wasm.luau')}")
-
-    step("optimizing Spider's output")
-    run([sys.executable, tools / "optimize_luau.py", build / "imgui_wasm.luau", build / "imgui_wasm.opt.luau"])
-    wasm_luau = build / "imgui_wasm.opt.luau"
-    if args.minify:
-        step("minifying")
-        run([sys.executable, tools / "minify_luau.py", wasm_luau, build / "imgui_wasm.min.luau"])
-        wasm_luau = build / "imgui_wasm.min.luau"
+    wasm_luau = translate(build / "imgui.wasm", build / "imgui_wasm", args)
 
     step("bundling")
     command = [
@@ -382,9 +513,31 @@ def build_variant(name: str, args) -> None:
     ]
     if args.optimize_directive:
         command.append("--optimize-directive")
-    if variant["text_editor"]:
-        command.append("--text-editor")
     run(command)
+
+
+def build_addon(name: str, args) -> None:
+    addon = ADDONS[name]
+    out = bundle_path(name)
+    print(f"=== {name} -> {relative(out)}", flush=True)
+    step("bundling")
+    command = [
+        sys.executable, ROOT / "tools" / "bundle_addon.py", "--source", addon["luau"], "--version", IMGUI_VERSION,
+        "--date", args.date, "--notice", addon["notice"], "--out", out,
+    ]
+    for branch_key in BRANCHES:
+        command += ["--module", f"{branch_key}={addon_module_luau(name, branch_key, args)},{addon_dir(name, branch_key) / 'module.json'}"]
+    if args.optimize_directive:
+        command.append("--optimize-directive")
+    run(command)
+
+
+def selected_targets(names: list[str]) -> tuple[list[str], list[str]]:
+    names = [name for name in names if name != "all"] or [*VARIANTS, *ADDONS]
+    unknown = [name for name in names if name not in VARIANTS and name not in ADDONS]
+    if unknown:
+        raise BuildError(f"unknown bundle {', '.join(unknown)} (expected {', '.join([*VARIANTS, *ADDONS])})")
+    return [name for name in names if name in VARIANTS], [name for name in names if name in ADDONS]
 
 
 def selected_variants(names: list[str]) -> list[str]:
@@ -396,17 +549,21 @@ def selected_variants(names: list[str]) -> list[str]:
 
 
 def command_build(args) -> int:
-    names = selected_variants(args.variants)
+    variants, addons = selected_targets(args.variants)
     require_compilers()
-    branches = {VARIANTS[name]["branch"] for name in names}
-    require([path for key in branches for path in (BRANCHES[key]["imgui"] / "imgui.cpp", BRANCHES[key]["bindings"] / "dcimgui.json")])
-    if any(VARIANTS[name]["text_editor"] for name in names):
-        require([TEXT_EDITOR / "TextEditor.cpp"])
+    branches = [key for key in BRANCHES if addons or any(VARIANTS[name]["branch"] == key for name in variants)]
+    require([BRANCHES[key]["imgui"] / "imgui.cpp" for key in branches])
+    require([BRANCHES[VARIANTS[name]["branch"]]["bindings"] / "dcimgui.json" for name in variants])
+    require([path for addon in ADDONS.values() for path in addon["sources"]])
     started = time.time()
-    for name in names:
-        build_variant(name, args)
+    # Every bundle exports what the addons import, so addon modules are built first
+    modules = {(addon, key): build_addon_module(addon, key, args) for addon in ADDONS for key in branches}
+    for name in variants:
+        build_variant(name, args, {addon: modules[(addon, VARIANTS[name]["branch"])] for addon in ADDONS})
+    for name in addons:
+        build_addon(name, args)
     print(f"Built in {time.time() - started:.0f} s:")
-    for name in names:
+    for name in [*variants, *addons]:
         print(f"   {relative(bundle_path(name)):<24} {size(bundle_path(name))}")
     return 0
 
@@ -445,23 +602,32 @@ def require_bundle(bundle: Path) -> None:
         raise BuildError(f"{relative(bundle)} is missing: run python build.py first")
 
 
-def run_harness(script: Path, bundle: Path, tag: str, luau: str, flags: list[str]) -> tuple[int, str]:
-    """Runs a tests/harness script against a bundle."""
+def addon_prelude(addons: list[str]) -> str:
+    """Loads addons from dist/ as ImGuiAddons.<name>, as a script's loadstring would."""
+    parts = ["\nImGuiAddons = {}\n"]
+    for name in addons:
+        require_bundle(bundle_path(name))
+        parts.append(f"ImGuiAddons.{name} = (function(...)\n" + read(bundle_path(name)) + "\nend)()\n")
+    return "".join(parts)
+
+
+def run_harness(script: Path, bundle: Path, tag: str, luau: str, flags: list[str], addons: list[str] = ()) -> tuple[int, str]:
+    """Runs a tests/harness script against a bundle (and addons)."""
     require_bundle(bundle)
     source = (
-        read(HARNESS / "mock_env.luau") + read(HARNESS / "widgets_ui.luau")
+        read(HARNESS / "mock_env.luau") + read(HARNESS / "widgets_ui.luau") + addon_prelude(list(addons))
         + "\nImGuiBundle = (function(...)\n" + read(bundle) + "\nend)()\n" + read(script)
     )
     return run_luau(script.stem + tag, source, luau, flags)
 
 
-def run_example(path: Path, bundle_name: str, luau: str) -> tuple[int, str]:
-    """Runs a script from examples/ against its bundle, with stand-ins for Roblox services and executor functions."""
+def run_example(path: Path, bundle_name: str, addons: list[str], luau: str) -> tuple[int, str]:
+    """Runs a script from examples/ against its bundle and addons, with stand-ins for Roblox services and executor functions."""
     bundle = bundle_path(bundle_name)
     require_bundle(bundle)
-    script = EXAMPLE_LOAD.sub("ImGuiBundle", read(path), count=1)
+    script = EXAMPLE_LOAD.sub(lambda m: "ImGuiBundle" if m.group(1) in VARIANTS else f"ImGuiAddons.{m.group(1)}", read(path))
     source = (
-        read(HARNESS / "mock_env.luau") + read(HARNESS / "example_env.luau")
+        read(HARNESS / "mock_env.luau") + read(HARNESS / "example_env.luau") + addon_prelude(addons)
         + "\nImGuiBundle = (function(...)\n" + read(bundle) + "\nend)()\n"
         + read(HARNESS / "example_prelude.luau") + "\ndo\n" + script + "\nend\n" + read(HARNESS / "example_driver.luau")
     )
@@ -473,7 +639,7 @@ def run_share_pair(first: str, second: str, luau: str) -> tuple[int, str]:
     for name in (first, second):
         require_bundle(bundle_path(name))
     source = (
-        read(HARNESS / "mock_env.luau") + read(HARNESS / "widgets_ui.luau")
+        read(HARNESS / "mock_env.luau") + read(HARNESS / "widgets_ui.luau") + addon_prelude(list(ADDONS))
         + f'\nShareBuildA, ShareBuildB = "{first}", "{second}"\n'
         + "ImGuiBundleA = (function(...)\n" + read(bundle_path(first)) + "\nend)()\n"
         + "ImGuiBundleB = (function(...)\n" + read(bundle_path(second)) + "\nend)()\n"
@@ -504,6 +670,13 @@ def command_test(args) -> int:
             started = time.time()
             code, output = run_harness(HARNESS / f"{test}.luau", bundle_path(name), f"_{name}", luau, ["-O2"])
             failures += not report(f"{name}.luau", test, code, output, started)
+        for addon_name, addon in ADDONS.items():
+            for test in addon["tests"]:
+                if args.tests and test not in args.tests:
+                    continue
+                started = time.time()
+                code, output = run_harness(HARNESS / f"{test}.luau", bundle_path(name), f"_{name}", luau, ["-O2"], [addon_name])
+                failures += not report(f"{name}.luau + {addon_name}.luau", test, code, output, started)
 
     if not args.tests or "share_test" in args.tests:
         for first, second in SHARE_PAIRS:
@@ -516,16 +689,18 @@ def command_test(args) -> int:
     if not args.tests or "examples" in args.tests:
         for example in sorted(EXAMPLES.glob("*.luau")):
             started = time.time()
-            match = EXAMPLE_LOAD.search(read(example))
+            loads = [match.group(1) for match in EXAMPLE_LOAD.finditer(read(example))]
+            bundles = [load for load in loads if load in VARIANTS]
             label = f"examples/{example.name}"
-            if match is None or match.group(1) not in VARIANTS:
-                print(f"FAIL  {'?':<20} {label} has no loadstring(game:HttpGet(.../releases/latest/download/<bundle>.luau))() line")
+            if len(bundles) != 1 or any(load not in VARIANTS and load not in ADDONS for load in loads):
+                print(f"FAIL  {'?':<26} {label} must load one bundle (and addons) with loadstring(game:HttpGet(.../releases/latest/download/<file>.luau))()")
                 failures += 1
                 continue
-            if match.group(1) not in names:
+            if bundles[0] not in names:
                 continue
-            code, output = run_example(example, match.group(1), luau)
-            failures += not report(f"{match.group(1)}.luau", label, code, output, started)
+            addons = [load for load in loads if load in ADDONS]
+            code, output = run_example(example, bundles[0], addons, luau)
+            failures += not report(" + ".join(f"{load}.luau" for load in [bundles[0], *addons]), label, code, output, started)
 
     print(f"{failures} failure(s)")
     return 1 if failures else 0
@@ -582,15 +757,15 @@ def main() -> int:
         print("Python 3.9 or newer is required", file=sys.stderr)
         return 1
     argv = sys.argv[1:]
-    if not argv or argv[0] == "all" or argv[0] in VARIANTS or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
+    if not argv or argv[0] == "all" or argv[0] in VARIANTS or argv[0] in ADDONS or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
         argv = ["build", *argv]
 
     parser = argparse.ArgumentParser(prog="build.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup", help="download and prepare every toolchain")
-    build = commands.add_parser("build", help="build bundles (the default command)")
-    build.add_argument("variants", nargs="*", help=f"bundles to build: {', '.join(VARIANTS)} (default: all)")
-    build.add_argument("--opt", default="-O2", help="em++ optimization flags, e.g. -Oz for smaller bundles (default -O2)")
+    build = commands.add_parser("build", help="build bundles and addons (the default command)")
+    build.add_argument("variants", nargs="*", help=f"what to build: {', '.join([*VARIANTS, *ADDONS])} (default: all)")
+    build.add_argument("--opt", default="-O2", help="em++ optimization flags for bundles, e.g. -Oz for smaller bundles (default -O2)")
     build.add_argument("--no-minify", dest="minify", action="store_false", help="keep Spider's names and layout")
     build.add_argument("--no-optimize-directive", dest="optimize_directive", action="store_false", help="leave out --!optimize 2")
     build.add_argument("--date", default=datetime.date.today().isoformat(), help="build date written in the header")
