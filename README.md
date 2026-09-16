@@ -118,18 +118,18 @@ More in the wiki: [Getting started](../../wiki/Getting-Started) · [Init options
 
 ## Downloads
 
-| File | Size | |
+| File | Size | Description |
 |---|---|---|
-| `imgui.luau` | 3.2 MB | Dear ImGui: every widget, without the demo window and debug tools |
-| `imgui_debug.luau` | 4.7 MB | the same plus `ImGui.ShowDemoWindow()`, the Metrics/Debugger and the other debug tools |
-| `docking.luau` | 3.7 MB | Dear ImGui's docking branch: windows dock into each other and into dockspaces |
-| `docking_debug.luau` | 5.3 MB | the docking branch plus the demo window and debug tools |
-| `ide.luau` | 2.6 MB | addon for any of the four: `ImGui.TextEditor`, a code editor |
-| `implot.luau` | 4.4 MB | addon: `ImGui.ImPlot`, interactive plots |
-| `imguizmo.luau` | 0.5 MB | addon: `ImGui.ImGuizmo`, 3D move, rotate and scale handles |
+| `imgui.luau` | 3.03 MB | Dear ImGui: every widget, without the demo window and debug tools |
+| `imgui_debug.luau` | 4.46 MB | the same plus `ImGui.ShowDemoWindow()`, the Metrics/Debugger and the other debug tools |
+| `docking.luau` | 3.55 MB | Dear ImGui's docking branch |
+| `docking_debug.luau` | 5.07 MB | the docking branch plus the demo window and debug tools |
+| `ide.luau` | 2.5 MB | addon: `ImGui.TextEditor`, a code editor |
+| `implot.luau` | 4.16 MB | addon: `ImGui.ImPlot`, interactive plots |
+| `imguizmo.luau` | 0.5 MB | addon: `ImGui.ImGuizmo`, 3D handles |
 | `imnodes.luau` | 0.4 MB | addon: `ImGui.ImNodes`, a node editor |
-| `markdown.luau` | 0.1 MB | addon: `ImGui.Markdown`, Markdown text |
-| `notify.luau` | 0.1 MB | addon: `ImGui.InsertNotification`, toast notifications |
+| `markdown.luau` | 0.1 MB | addon: `ImGui.Markdown` |
+| `notify.luau` | 0.1 MB | addon: toast notifications |
 
 Every file loads the same way; change the name at the end of the URL, e.g. `https://github.com/lithium1on/imgui-roblox/releases/latest/download/docking.luau`.
 
