@@ -1446,6 +1446,10 @@ local function LoadAddon(addon)
 		Exports = exports,
 		Raw = Raw,
 		Mem = Mem,
+		Handle = Api.Handle,
+		ReadCString = function(ptr)
+			return ReadCString(Mem(), ptr)
+		end,
 		Malloc = function(size)
 			return (F.malloc[1](F.malloc, size))
 		end,

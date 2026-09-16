@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Reads what the build needs from a WebAssembly module: its imports, its exports and, for side modules, the memory and
-table sizes in the dylink.0 section."""
+"""Reads what the build needs from a WebAssembly module: its imports, its exports and their function signatures and, for
+side modules, the memory and table sizes in the dylink.0 section."""
 from __future__ import annotations
 
 import pathlib
 
 KINDS = {0: "func", 1: "table", 2: "memory", 3: "global", 4: "tag"}
+VALUE_TYPES = {0x7F: "i", 0x7E: "j", 0x7D: "f", 0x7C: "d"}
 
 
 def _leb(data: bytes, pos: int) -> tuple[int, int]:
@@ -33,11 +34,14 @@ def _skip_limits(data: bytes, pos: int) -> int:
 
 
 def read_module(path: str | pathlib.Path) -> dict:
-    """{"imports": [(module, name, kind)], "exports": [(name, kind)], "memory_size", "memory_align", "table_size"}"""
+    """{"imports": [(module, name, kind)], "exports": [(name, kind)], "signatures": {name: "params:results"},
+    "memory_size", "memory_align", "table_size"}. A signature has a letter per value: i (i32), j (i64), f (f32), d (f64)."""
     data = pathlib.Path(path).read_bytes()
     if data[:4] != b"\0asm":
         raise ValueError(f"{path} is not a WebAssembly module")
-    info = {"imports": [], "exports": [], "memory_size": 0, "memory_align": 0, "table_size": 0}
+    info = {"imports": [], "exports": [], "signatures": {}, "memory_size": 0, "memory_align": 0, "table_size": 0}
+    types: list[str] = []
+    functions: list[int] = []
     pos = 8
     while pos < len(data):
         section = data[pos]
@@ -54,6 +58,21 @@ def read_module(path: str | pathlib.Path) -> dict:
                     info["memory_align"], q = _leb(data, q)
                     info["table_size"], q = _leb(data, q)
                 p += subsection_size
+        elif section == 1:
+            count, p = _leb(data, pos)
+            for _ in range(count):
+                p += 1
+                params, p = _leb(data, p)
+                param_types = "".join(VALUE_TYPES.get(data[p + index], "?") for index in range(params))
+                p += params
+                results, p = _leb(data, p)
+                types.append(param_types + ":" + "".join(VALUE_TYPES.get(data[p + index], "?") for index in range(results)))
+                p += results
+        elif section == 3:
+            count, p = _leb(data, pos)
+            for _ in range(count):
+                type_index, p = _leb(data, p)
+                functions.append(type_index)
         elif section == 2:
             count, p = _leb(data, pos)
             for _ in range(count):
@@ -62,7 +81,8 @@ def read_module(path: str | pathlib.Path) -> dict:
                 kind = data[p]
                 p += 1
                 if kind == 0:
-                    _, p = _leb(data, p)
+                    type_index, p = _leb(data, p)
+                    functions.append(type_index)
                 elif kind == 1:
                     p = _skip_limits(data, p + 1)
                 elif kind == 2:
@@ -77,9 +97,13 @@ def read_module(path: str | pathlib.Path) -> dict:
             for _ in range(count):
                 field, p = _name(data, p)
                 kind = data[p]
-                _, p = _leb(data, p + 1)
+                index, p = _leb(data, p + 1)
                 info["exports"].append((field, KINDS[kind]))
+                if kind == 0:
+                    info["signatures"][field] = index
         pos = end
+    for field, index in info["signatures"].items():
+        info["signatures"][field] = types[functions[index]]
     return info
 
 

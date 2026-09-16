@@ -1,7 +1,7 @@
 # Third-party notices
 
 The bundles built by this project (`imgui.luau`, `imgui_debug.luau`, `docking.luau`, `docking_debug.luau`) and its
-addons (`ide.luau`) contain code from the projects below.
+addons (`ide.luau`, `implot.luau`, `imguizmo.luau`, `imnodes.luau`, `markdown.luau`, `notify.luau`) contain code from the projects below.
 The project's own code is under the [MIT License](LICENSE).
 
 ## Dear ImGui
@@ -42,6 +42,143 @@ The IDE addon (`ide.luau`, `ImGui.TextEditor`), compiled into its WebAssembly mo
 MIT License
 
 Copyright (c) 2024-2026 Johan A. Goossens. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## ImPlot
+
+The ImPlot addon (`implot.luau`, `ImGui.ImPlot`), compiled into its WebAssembly modules, unmodified. <https://github.com/epezent/implot>, commit 7eeb9168d2e5e6b14e266d8782ecf7e649dfc3a4.
+
+```
+MIT License
+
+Copyright (c) 2020 Evan Pezent
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## ImGuizmo
+
+The ImGuizmo addon (`imguizmo.luau`, `ImGui.ImGuizmo`), compiled into its WebAssembly modules, unmodified (`ImGuizmo.cpp` only). <https://github.com/CedricGuillemet/ImGuizmo>, commit 18cef5e031d8c6973d80284c67f60549fafd78c1.
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2016 Cedric Guillemet
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## imnodes
+
+The ImNodes addon (`imnodes.luau`, `ImGui.ImNodes`), compiled into its WebAssembly modules, unmodified. <https://github.com/Nelarius/imnodes>, commit eb36902c892548ef94f88f51ad7e7c9c7058a71c.
+
+```
+MIT License
+
+Copyright (c) 2019 Johann Muszynski
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## imgui_markdown
+
+The Markdown addon (`markdown.luau`, `ImGui.Markdown`), compiled into its WebAssembly modules, unmodified. <https://github.com/enkisoftware/imgui_markdown>, commit 4acbf80584753e15ea54eb271129995862daac8f.
+
+```
+Copyright (c) 2019 Juliette Foucaut and Doug Binks
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgement in the product documentation would be
+   appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+```
+
+## ImGuiNotify
+
+The Notify addon (`notify.luau`, `ImGui.InsertNotification`), compiled into its WebAssembly modules, unmodified; its Font Awesome icons are replaced by plain characters. <https://github.com/TyomaVader/ImGuiNotify>, commit d00e45f8d6b1e094bc9288d20eb3d2840f6a7d73.
+
+```
+MIT License
+
+Copyright (c) 2021 Patrick
+Copyright (c) 2024 TyomaVader
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

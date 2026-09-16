@@ -93,7 +93,44 @@ function HttpService:JSONDecode()
 	error("JSONDecode is not available in the example test environment")
 end
 
-workspace = { CurrentCamera = { ViewportSize = Vector2.new(1280, 800) } }
+Vector3 = {
+	new = function(x, y, z)
+		return { X = x or 0, Y = y or 0, Z = z or 0 }
+	end,
+}
+
+-- Rigid CFrames: a position and a rotation matrix given by rows
+local CFrameMeta = {}
+CFrameMeta.__index = CFrameMeta
+function CFrameMeta:GetComponents()
+	return table.unpack(self.Components, 1, 12)
+end
+function CFrameMeta:Inverse()
+	local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = self:GetComponents()
+	return CFrame.new(-(r00 * x + r10 * y + r20 * z), -(r01 * x + r11 * y + r21 * z), -(r02 * x + r12 * y + r22 * z),
+		r00, r10, r20, r01, r11, r21, r02, r12, r22)
+end
+CFrame = {
+	new = function(x, y, z, ...)
+		local rotation = { ... }
+		if #rotation == 0 then
+			rotation = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }
+		end
+		return setmetatable({ Components = { x or 0, y or 0, z or 0, table.unpack(rotation, 1, 9) } }, CFrameMeta)
+	end,
+}
+
+workspace = { CurrentCamera = { ViewportSize = Vector2.new(1280, 800), CFrame = CFrame.new(0, 12, 30), FieldOfView = 70 } }
+
+Instance = {
+	new = function(className)
+		local instance = { ClassName = className, Name = className, Size = Vector3.new(4, 1, 2), CFrame = CFrame.new(0, 0, 0) }
+		function instance:Destroy()
+			self.Parent = nil
+		end
+		return instance
+	end,
+}
 
 local services = {
 	Players = Players,

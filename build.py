@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dear ImGui for Roblox: set up the toolchains, build, test and benchmark, on Windows, macOS and Linux.
 
-    python build.py setup           download Dear ImGui (master and docking), dear_bindings, ImGuiColorTextEdit, Emscripten, Spider, Luau
+    python build.py setup           download Dear ImGui (master and docking), dear_bindings, the addons' libraries, Emscripten, Spider, Luau
     python build.py                 build every bundle and addon into dist/
     python build.py docking ide     build some of them (names below, without .luau)
     python build.py test            run the headless tests and the examples against every bundle
@@ -18,6 +18,11 @@ Bundles:
 
 Addons, loaded next to any bundle with ImGui.Init({ Addons = ... }):
     ide.luau             ImGuiColorTextEdit, a code editor, as ImGui.TextEditor
+    implot.luau          ImPlot, interactive plots, as ImGui.ImPlot
+    imguizmo.luau        ImGuizmo, 3D move, rotate and scale handles, as ImGui.ImGuizmo
+    imnodes.luau         imnodes, a node editor, as ImGui.ImNodes
+    markdown.luau        imgui_markdown, Markdown text, as ImGui.Markdown
+    notify.luau          ImGuiNotify, toast notifications, as ImGui.InsertNotification
 
 Requirements: Python 3.9 or newer. The first setup also needs Rust (https://rustup.rs), because Spider is compiled from
 source.
@@ -57,8 +62,22 @@ DEAR_BINDINGS_VERSION = "0.21"
 EMSDK_VERSION = "6.0.9"
 SPIDER_COMMIT = "cfaf2fb7d68988d0183fb65d4182f3a5a1127282"
 LUAU_VERSION = "0.738"
-TEXT_EDITOR_COMMIT = "f28136480fa4091164e0b528dc9cca147c5a6ee9"  # goossens/ImGuiColorTextEdit, made for Dear ImGui 1.92.9
+# Libraries the addons compile: folder in third_party/ -> (GitHub repository, commit), all made for Dear ImGui 1.92.9
+LIBRARIES = {
+    "ImGuiColorTextEdit": ("goossens/ImGuiColorTextEdit", "f28136480fa4091164e0b528dc9cca147c5a6ee9"),
+    "implot": ("epezent/implot", "7eeb9168d2e5e6b14e266d8782ecf7e649dfc3a4"),
+    "ImGuizmo": ("CedricGuillemet/ImGuizmo", "18cef5e031d8c6973d80284c67f60549fafd78c1"),
+    "imnodes": ("Nelarius/imnodes", "eb36902c892548ef94f88f51ad7e7c9c7058a71c"),
+    "imgui_markdown": ("enkisoftware/imgui_markdown", "4acbf80584753e15ea54eb271129995862daac8f"),
+    "ImGuiNotify": ("TyomaVader/ImGuiNotify", "d00e45f8d6b1e094bc9288d20eb3d2840f6a7d73"),
+}
 TEXT_EDITOR = THIRD_PARTY / "ImGuiColorTextEdit"
+IMPLOT = THIRD_PARTY / "implot"
+IMGUIZMO = THIRD_PARTY / "ImGuizmo"
+IMNODES = THIRD_PARTY / "imnodes"
+IMGUI_MARKDOWN = THIRD_PARTY / "imgui_markdown"
+IMGUI_NOTIFY = THIRD_PARTY / "ImGuiNotify"
+ADDON_SOURCES = ROOT / "src" / "addons"
 NOTICE = "Dear ImGui (c) Omar Cornut, MIT License; Spider runtime helpers, MPL-2.0"
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -92,16 +111,62 @@ VARIANTS = {
 # An addon is C++ built into a position-independent WebAssembly side module per Dear ImGui branch, plus the Luau that
 # wraps it. The runtime links the module into the running context (see "Addons" in luau/runtime.luau); every bundle
 # exports the Dear ImGui symbols the addons import.
+# Optional keys: "flags" (extra compiler flags), "config" (Dear ImGui user config header, default imconfig_roblox.h) and
+# "enums" ((header, prefixes): C enums of the header become Luau tables, e.g. ImPlotFlags_ -> Enums.Flags).
 ADDONS = {
     "ide": {
-        "sources": [TEXT_EDITOR / "TextEditor.cpp", ROOT / "src" / "addons" / "text_editor.cpp"],
+        "sources": [TEXT_EDITOR / "TextEditor.cpp", ADDON_SOURCES / "text_editor.cpp"],
         "includes": [TEXT_EDITOR],
-        "exports": r"RBX_EXPORT [^(]*?\b(rbx_te_\w+)\(",
         "luau": ROOT / "luau" / "addons" / "ide.luau",
         "notice": "ImGuiColorTextEdit (c) Johan A. Goossens, MIT License; Spider runtime helpers, MPL-2.0",
         "tests": ["text_editor_test"],
     },
+    "implot": {
+        "sources": [IMPLOT / "implot.cpp", IMPLOT / "implot_items.cpp", ADDON_SOURCES / "implot.cpp"],
+        "includes": [IMPLOT],
+        "flags": ["-DIMPLOT_CUSTOM_NUMERIC_TYPES=(double)"],  # Luau numbers are doubles: one instantiation per plot type
+        "enums": (IMPLOT / "implot.h", ["ImPlot", "Im"]),
+        "luau": ROOT / "luau" / "addons" / "implot.luau",
+        "notice": "ImPlot (c) Evan Pezent, MIT License; Spider runtime helpers, MPL-2.0",
+        "tests": ["implot_test"],
+    },
+    "imguizmo": {
+        "sources": [IMGUIZMO / "src" / "ImGuizmo.cpp", ADDON_SOURCES / "imguizmo.cpp"],
+        "includes": [IMGUIZMO / "src"],
+        "luau": ROOT / "luau" / "addons" / "imguizmo.luau",
+        "notice": "ImGuizmo (c) Cedric Guillemet, MIT License; Spider runtime helpers, MPL-2.0",
+        "tests": ["imguizmo_test"],
+    },
+    "imnodes": {
+        "sources": [IMNODES / "imnodes.cpp", ADDON_SOURCES / "imnodes.cpp"],
+        "includes": [IMNODES, ADDON_SOURCES / "imnodes"],
+        "config": "imconfig_imnodes.h",
+        "enums": (IMNODES / "imnodes.h", ["ImNodes"]),
+        "luau": ROOT / "luau" / "addons" / "imnodes.luau",
+        "notice": "imnodes (c) Johann Muszynski, MIT License; Spider runtime helpers, MPL-2.0",
+        "tests": ["imnodes_test"],
+    },
+    "markdown": {
+        "sources": [ADDON_SOURCES / "markdown.cpp"],
+        "includes": [IMGUI_MARKDOWN],
+        "enums": (IMGUI_MARKDOWN / "imgui_markdown.h", ["ImGuiMarkdown"]),
+        "luau": ROOT / "luau" / "addons" / "markdown.luau",
+        "notice": "imgui_markdown (c) Juliette Foucaut and Doug Binks, zlib License; Spider runtime helpers, MPL-2.0",
+        "tests": ["markdown_test"],
+    },
+    "notify": {
+        "sources": [ADDON_SOURCES / "notify.cpp"],
+        # The icon header stand-in comes first; toasts go in the main viewport's corner on both branches
+        "includes": [ADDON_SOURCES / "notify", IMGUI_NOTIFY / "unixExample" / "backends"],
+        "flags": ["-DNOTIFY_RENDER_OUTSIDE_MAIN_WINDOW=false"],
+        "luau": ROOT / "luau" / "addons" / "notify.luau",
+        "notice": "ImGuiNotify (c) Patrick and TyomaVader, MIT License; Spider runtime helpers, MPL-2.0",
+        "tests": ["notify_test"],
+    },
 }
+# Compiled into every addon module next to its sources
+ADDON_SUPPORT = [ADDON_SOURCES / "addon_support.cpp", ROOT / "src" / "rbx_libc.cpp"]
+ADDON_EXPORT = re.compile(r"RBX_EXPORT [^(]*?\b(rbx_\w+)\(")
 # Emscripten libraries linked into addon modules; malloc and free come from the bundle
 PIC_LIBRARIES = ["libc++-noexcept", "libc++abi-noexcept", "libc"]
 
@@ -240,12 +305,18 @@ def setup_dear_bindings() -> None:
         target.write_bytes(download(f"https://github.com/dearimgui/dear_bindings/releases/download/{branch['release']}/dcimgui.json"))
 
 
-def setup_text_editor() -> None:
-    if (TEXT_EDITOR / "TextEditor.cpp").exists():
-        print(f"   ImGuiColorTextEdit: {relative(TEXT_EDITOR)} is ready")
-        return
-    step(f"ImGuiColorTextEdit {TEXT_EDITOR_COMMIT[:8]}")
-    extract_archive(download(f"https://github.com/goossens/ImGuiColorTextEdit/archive/{TEXT_EDITOR_COMMIT}.zip"), TEXT_EDITOR)
+def setup_libraries() -> None:
+    for folder, (repository, commit) in LIBRARIES.items():
+        target = THIRD_PARTY / folder
+        marker = target / ".commit"
+        if marker.exists() and read(marker).strip() == commit:
+            print(f"   {folder}: {relative(target)} is ready")
+            continue
+        if target.exists():
+            shutil.rmtree(target)
+        step(f"{folder} {commit[:8]}")
+        extract_archive(download(f"https://github.com/{repository}/archive/{commit}.zip"), target)
+        marker.write_text(commit + "\n", encoding="utf-8")
 
 
 def setup_emscripten() -> None:
@@ -314,7 +385,7 @@ def setup_luau() -> None:
 def command_setup(args) -> int:
     setup_imgui()
     setup_dear_bindings()
-    setup_text_editor()
+    setup_libraries()
     setup_emscripten()
     setup_pic_libraries()
     setup_spider()
@@ -379,8 +450,8 @@ def build_addon_module(name: str, branch_key: str, args) -> dict:
     work = addon_dir(name, branch_key)
     info_path = work / "module.json"
     inputs = [
-        *addon["sources"], ROOT / "src" / "rbx_libc.cpp", ROOT / "src" / "rbx_host.h", ROOT / "src" / "imconfig_roblox.h",
-        branch["imgui"] / "imgui.h", branch["imgui"] / "imgui_internal.h", Path(__file__),
+        *addon["sources"], *ADDON_SUPPORT, ADDON_SOURCES / "addon_common.h", ROOT / "src" / "rbx_host.h",
+        ROOT / "src" / "imconfig_roblox.h", branch["imgui"] / "imgui.h", branch["imgui"] / "imgui_internal.h", Path(__file__),
     ]
     if info_path.exists() and addon_module_luau(name, branch_key, args).exists():
         built = info_path.stat().st_mtime
@@ -394,16 +465,16 @@ def build_addon_module(name: str, branch_key: str, args) -> dict:
     flags = [
         "-std=c++17", "-DNDEBUG", "-fno-exceptions", "-fno-rtti", "-Oz",
         "-fPIC", "-fvisibility=hidden", "-fvisibility-inlines-hidden",
-        f"-I{branch['imgui']}", f"-I{ROOT / 'src'}", *(f"-I{path}" for path in addon["includes"]),
-        '-DIMGUI_USER_CONFIG="imconfig_roblox.h"',
+        *(f"-I{path}" for path in addon["includes"]), f"-I{branch['imgui']}", f"-I{ROOT / 'src'}", f"-I{ADDON_SOURCES}",
+        f'-DIMGUI_USER_CONFIG="{addon.get("config", "imconfig_roblox.h")}"', *addon.get("flags", []),
     ]
     step("compiling (-Oz, position-independent)")
     objects = []
-    for source in [*addon["sources"], ROOT / "src" / "rbx_libc.cpp"]:
-        obj = work / f"{source.stem}.o"
+    for source in [*addon["sources"], *ADDON_SUPPORT]:
+        obj = work / f"{source.parent.name}_{source.stem}.o"
         run([sys.executable, em_tool("em++"), "-c", source, *flags, "-o", obj], env=emscripten_env())
         objects.append(obj)
-    exports = sorted({symbol for source in addon["sources"] for symbol in re.findall(addon["exports"], read(source))})
+    exports = sorted({symbol for source in addon["sources"] for symbol in ADDON_EXPORT.findall(read(source))})
 
     step("linking the side module")
     wasm = work / "module.wasm"
@@ -419,6 +490,7 @@ def build_addon_module(name: str, branch_key: str, args) -> dict:
     info = {
         "memory_size": module["memory_size"], "memory_align": module["memory_align"], "table_size": module["table_size"],
         "imports": [list(entry) for entry in module["imports"]], "exports": [entry[0] for entry in module["exports"]],
+        "signatures": {symbol: module["signatures"][symbol] for symbol in exports},
     }
     info_path.write_text(json.dumps(info, indent=1), encoding="utf-8", newline="\n")
     return info
@@ -516,15 +588,55 @@ def build_variant(name: str, args, addon_modules: dict[str, dict]) -> None:
     run(command)
 
 
+def extract_enums(header: Path, prefixes: list[str]) -> dict[str, dict[str, int]]:
+    """The header's C enums as {table: {name: value}}: enum ImPlotFlags_ { ImPlotFlags_NoTitle = 1 << 0 } with prefix
+    ImPlot becomes {"Flags": {"NoTitle": 1}}. Values may name Dear ImGui's constants (ImPlotCond_Once = ImGuiCond_Once);
+    entries whose value isn't a constant expression are left out."""
+    known: dict[str, int] = {}
+    enum_tables(BRANCHES["master"]["imgui"] / "imgui.h", [], known)
+    return enum_tables(header, prefixes, known)
+
+
+def enum_tables(header: Path, prefixes: list[str], known: dict[str, int]) -> dict[str, dict[str, int]]:
+    text = re.sub(r"//[^\n]*|/\*.*?\*/", "", read(header), flags=re.S)
+    tables: dict[str, dict[str, int]] = {}
+    for enum_name, body in re.findall(r"\benum\s+(\w+)\s*\{(.*?)\}", text, flags=re.S):
+        base = enum_name.rstrip("_")
+        table = next((base[len(prefix):] for prefix in prefixes if base.startswith(prefix) and len(base) > len(prefix)), base)
+        entries: dict[str, int] = {}
+        next_value = 0
+        for item in body.split(","):
+            key, _, expression = (part.strip() for part in item.partition("="))
+            if not re.fullmatch(r"\w+", key):
+                continue
+            if expression:
+                try:
+                    value = int(eval(re.sub(r"\b(\d+)[uUlL]+\b", r"\1", expression), {"__builtins__": {}}, known))  # noqa: S307
+                except Exception:
+                    continue
+            else:
+                value = next_value
+            known[key] = value
+            next_value = value + 1
+            entries[key[len(enum_name):] if key.startswith(enum_name) else key] = value
+        tables[table] = entries
+    return tables
+
+
 def build_addon(name: str, args) -> None:
     addon = ADDONS[name]
     out = bundle_path(name)
     print(f"=== {name} -> {relative(out)}", flush=True)
     step("bundling")
     command = [
-        sys.executable, ROOT / "tools" / "bundle_addon.py", "--source", addon["luau"], "--version", IMGUI_VERSION,
-        "--date", args.date, "--notice", addon["notice"], "--out", out,
+        sys.executable, ROOT / "tools" / "bundle_addon.py", "--source", addon["luau"], "--common", ROOT / "luau" / "addons" / "common.luau",
+        "--version", IMGUI_VERSION, "--date", args.date, "--notice", addon["notice"], "--out", out,
     ]
+    if "enums" in addon:
+        enums_path = BUILD / "addons" / name / "enums.json"
+        enums_path.parent.mkdir(parents=True, exist_ok=True)
+        enums_path.write_text(json.dumps(extract_enums(*addon["enums"]), indent=1), encoding="utf-8", newline="\n")
+        command += ["--enums", enums_path]
     for branch_key in BRANCHES:
         command += ["--module", f"{branch_key}={addon_module_luau(name, branch_key, args)},{addon_dir(name, branch_key) / 'module.json'}"]
     if args.optimize_directive:

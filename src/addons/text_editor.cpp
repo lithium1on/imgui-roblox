@@ -2,28 +2,11 @@
 // luau/runtime.luau wraps as ImGui.TextEditor. Lines and indexes are zero-based, as in TextEditor. Strings go in as
 // pointer + length and come out as a pointer to a buffer the editor keeps until its next string result.
 #include "TextEditor.h"
-#include "rbx_host.h"
-
-#include <emscripten/emscripten.h>
+#include "addon_common.h"
 
 #include <cstdint>
-#include <ctime>
 #include <string>
 #include <string_view>
-
-// Built with -fvisibility=hidden as a side module: only these exports stay visible to the dynamic linker
-#define RBX_EXPORT extern "C" EMSCRIPTEN_KEEPALIVE __attribute__((visibility("default")))
-
-extern "C" {
-// TextEditor times change reports with std::chrono::system_clock: seconds from the host instead of a WASI clock import
-int clock_gettime(clockid_t, struct timespec* ts)
-{
-    const double now = rbx_host_clock_now();
-    ts->tv_sec = (time_t)now;
-    ts->tv_nsec = (long)((now - (double)ts->tv_sec) * 1e9);
-    return 0;
-}
-}
 
 namespace {
 
