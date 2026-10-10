@@ -239,6 +239,25 @@ RBX_EXPORT int rbx_io_state(void)
     return state;
 }
 
+// 1 when (x, y) lies on a window that takes mouse input, using the windows of the last frame. A touch has no hover before
+// it lands, so the host asks this to keep the touch away from the game (camera, thumbstick) from its first moment on.
+RBX_EXPORT int rbx_hit_test(double x, double y)
+{
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    if (ctx == NULL)
+        return 0;
+    const ImVec2 pos((float)x, (float)y);
+    for (int i = ctx->Windows.Size - 1; i >= 0; i--)
+    {
+        const ImGuiWindow* window = ctx->Windows[i];
+        if (!window->WasActive || window->Hidden || (window->Flags & ImGuiWindowFlags_NoMouseInputs))
+            continue;
+        if (window->Rect().Contains(pos))
+            return 1;
+    }
+    return 0;
+}
+
 //-----------------------------------------------------------------------------
 // Frame
 //-----------------------------------------------------------------------------

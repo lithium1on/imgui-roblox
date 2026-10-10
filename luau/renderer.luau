@@ -1,7 +1,8 @@
 -- Dear ImGui for Roblox: render modes
--- Turns the draw table produced by rbx_render() (src/imgui_rbx.cpp) into primitives for one of two render modes:
+-- Turns the draw table produced by rbx_render() (src/imgui_rbx.cpp) into primitives for one of three render modes:
 --   DrawingImmediate  Potassium's immediate-mode drawing, called from a DrawingImmediate.GetPaint event
 --   Drawing           the UNC Drawing library: retained objects, pooled and updated in place every frame
+--   Cesium            real Roblox UI instances (Frame, TextLabel, UICorner, UIGradient) in a ScreenGui; works in Studio
 -- The bundle runs this chunk once; runtime.luau receives the returned table.
 
 local band, bor, rshift, lshift = bit32.band, bit32.bor, bit32.rshift, bit32.lshift
@@ -17,7 +18,11 @@ local Renderer = {}
 -- Modes and fonts
 --------------------------------------------------------------------------------
 
-local ModeNames = { auto = "Auto", drawingimmediate = "DrawingImmediate", drawing = "Drawing" }
+-- The name of the Roblox UI instance mode, as RenderMode and as the ImGui table that configures it (ImGui.Cesium.Parent)
+local INSTANCE_MODE = "Cesium"
+Renderer.InstanceMode = INSTANCE_MODE
+
+local ModeNames = { auto = "Auto", drawingimmediate = "DrawingImmediate", drawing = "Drawing", [slower(INSTANCE_MODE)] = INSTANCE_MODE }
 
 function Renderer.NormalizeMode(value)
 	if value == nil then
@@ -25,7 +30,7 @@ function Renderer.NormalizeMode(value)
 	end
 	local mode = type(value) == "string" and ModeNames[slower(value)]
 	if not mode then
-		error(sformat('[ImGui] unknown RenderMode %s (expected "DrawingImmediate", "Drawing" or "Auto")', tostring(value)), 3)
+		error(sformat('[ImGui] unknown RenderMode %s (expected "DrawingImmediate", "Drawing", "%s" or "Auto")', tostring(value), INSTANCE_MODE), 3)
 	end
 	return mode
 end
@@ -48,8 +53,11 @@ function Renderer.ResolveFont(mode, value)
 		end
 		value = index
 	end
+	if mode == INSTANCE_MODE and typeof(value) == "EnumItem" then
+		return value -- an Enum.Font
+	end
 	if mode ~= "Custom" and type(value) ~= "number" then
-		error("[ImGui] " .. mode .. " mode fonts are Drawing font indices (Drawing.Fonts.*) or font names", 3)
+		error("[ImGui] " .. mode .. " mode fonts are Drawing font indices (Drawing.Fonts.*) or font names" .. (if mode == INSTANCE_MODE then " (or an Enum.Font)" else ""), 3)
 	end
 	return value
 end
@@ -73,8 +81,12 @@ function Renderer.CreateGlyphMeasurer(mode, options, fontSlots)
 		local TextService = game:GetService("TextService")
 		local bounds = Vector2.new(1e6, 1e6)
 		fallbackName = "TextService"
+		local roundSize = mode == INSTANCE_MODE -- TextLabel.TextSize is a whole number between 1 and 100
 		fallbackText = function(font, size, text)
 			local robloxFont = if type(font) == "number" then Enum.Font[MeasureFontNames[font] or "RobotoMono"] else font
+			if roundSize then
+				size = min(100, max(1, floor(size + 0.5)))
+			end
 			return TextService:GetTextSize(text, size, robloxFont, bounds).X
 		end
 	else
@@ -84,10 +96,15 @@ function Renderer.CreateGlyphMeasurer(mode, options, fontSlots)
 		end
 	end
 
-	local trusted = options.MeasureText ~= nil
+	-- Text drawn by TextLabels is laid out by the engine that measures it: nothing to verify against drawn text
+	local instanceMode = mode == INSTANCE_MODE
+	local trusted = options.MeasureText ~= nil or instanceMode
 	local measureText, source = options.MeasureText, "MeasureText"
 	local drawing = options.Drawing or Drawing
-	local hasDrawing = drawing ~= nil and drawing.new ~= nil
+	local hasDrawing = not instanceMode and drawing ~= nil and drawing.new ~= nil
+	if measureText == nil and instanceMode then
+		measureText, source = fallbackText, fallbackName
+	end
 	local objects = {}
 	if measureText == nil and hasDrawing then
 		source = "Drawing"
@@ -1124,6 +1141,641 @@ function Renderer.Drawing(lib, fontSlots, options)
 		end
 		tclear(created)
 		tclear(pools)
+	end
+
+	return backend
+end
+
+--------------------------------------------------------------------------------
+-- Cesium (Roblox UI instances)
+--------------------------------------------------------------------------------
+-- Every primitive is a slot: a Frame whose ZIndex is its place in the draw order, so frames that draw the same things
+-- write nothing. A slot becomes a rectangle, a rounded rectangle or circle (UICorner), a gradient (UIGradient), half of
+-- a rotated rectangle (a triangle: a UIGradient with a hard edge masks the other half) or a clipping container with a
+-- TextLabel or a shape inside. Positions and sizes are scales of the parent's pixel size, because UDim offsets are whole
+-- numbers and Dear ImGui's coordinates are not.
+
+local WHITE = 0xFFFFFF
+
+-- Where the ScreenGui goes when ImGui.Cesium.Parent is not set: somewhere game scripts cannot see, if there is such a place
+function Renderer.DefaultParent()
+	local candidates = {
+		function()
+			return gethui()
+		end,
+		function()
+			return game:GetService("CoreGui")
+		end,
+		function()
+			return game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+		end,
+	}
+	local probe = Instance.new("Folder")
+	for _, candidate in candidates do
+		local ok, parent = pcall(candidate)
+		if ok and parent ~= nil then
+			-- Assigning a parent a script may not use does not error: the instance just stays unparented
+			pcall(function()
+				probe.Parent = parent
+			end)
+			local accepted = probe.Parent == parent
+			probe:Destroy()
+			if accepted then
+				return parent
+			end
+			probe = Instance.new("Folder")
+		end
+	end
+	probe:Destroy()
+	return nil
+end
+
+function Renderer.Cesium(fontSlots, options, requestedParent)
+	local new = Instance.new
+	local Color = CreateColorCache()
+	local UD2, UD = UDim2.new, UDim.new
+	local V2 = Vector2.new
+	local HALF, ZERO = V2(0.5, 0.5), V2(0, 0)
+	local atan2, deg = math.atan2, math.deg
+	local ZERO_UDIM = UD(0, 0)
+
+	-- The edge of a right triangle: opaque up to the middle of the gradient, transparent after it
+	local MASK = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.5, 0), NumberSequenceKeypoint.new(0.501, 1), NumberSequenceKeypoint.new(1, 1) })
+	local WHITE_SEQUENCE = ColorSequence.new(Color3.new(1, 1, 1))
+
+	local gui = new("ScreenGui")
+	gui.Name = options.Name or "DearImGui"
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = options.DisplayOrder or 2147483646
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	pcall(function()
+		gui.ScreenInsets = Enum.ScreenInsets.None -- the whole screen, notch included, like the coordinates of the input
+	end)
+	pcall(function()
+		gui.OnTopOfCoreBlur = true
+	end)
+
+	local backend = { ClipsText = true, ClipsShapes = true }
+	local parentWarned = false
+
+	local function Attach(parent)
+		if parent == nil then
+			parent = Renderer.DefaultParent()
+		end
+		if parent == nil then
+			return false
+		end
+		pcall(function()
+			gui.Parent = parent
+		end)
+		return gui.Parent == parent
+	end
+
+	if not Attach(requestedParent) then
+		gui:Destroy()
+		error("[ImGui] could not place the " .. INSTANCE_MODE .. " ScreenGui: set ImGui." .. INSTANCE_MODE .. ".Parent to a container your script may use", 3)
+	end
+
+	function backend.GetParent()
+		return gui.Parent
+	end
+
+	function backend.SetParent(parent)
+		local before = gui.Parent
+		if not Attach(parent) then
+			pcall(function()
+				gui.Parent = before
+			end)
+			if not parentWarned then
+				parentWarned = true
+				warn("[ImGui] the " .. INSTANCE_MODE .. " ScreenGui could not be moved to that parent")
+			end
+		end
+	end
+
+	function backend.GetScreenGui()
+		return gui
+	end
+
+	local W, H = 0, 0 -- pixel size of the ScreenGui this frame
+
+	function backend.GetDisplaySize()
+		local size = gui.AbsoluteSize
+		if size.X > 0 and size.Y > 0 then
+			return size.X, size.Y
+		end
+		return nil
+	end
+
+	local function FontOf(slot)
+		local font = fontSlots[slot]
+		if type(font) == "number" then
+			return Enum.Font[MeasureFontNames[font] or "RobotoMono"]
+		end
+		return font
+	end
+
+	---------------------------------------------------------------------------
+	-- Nodes: a Frame and what was last written to it
+	---------------------------------------------------------------------------
+
+	local function NewNode(frame)
+		frame.BorderSizePixel = 0
+		frame.BackgroundTransparency = 1
+		frame.Active = false
+		return { f = frame, trans = 1, rot = 0, anch = false }
+	end
+
+	-- Plain placement: (x, y, w, h) in pixels inside a parent of bw x bh pixels
+	local function Place(n, x, y, w, h, bw, bh)
+		local f = n.f
+		if n.anch then
+			f.AnchorPoint = ZERO
+			n.anch = false
+		end
+		if n.rot ~= 0 then
+			f.Rotation = 0
+			n.rot = 0
+		end
+		if n.x ~= x or n.y ~= y or n.bw ~= bw or n.bh ~= bh then
+			f.Position = UD2(x / bw, 0, y / bh, 0)
+			n.x, n.y = x, y
+		end
+		if n.w ~= w or n.h ~= h or n.bw ~= bw or n.bh ~= bh then
+			f.Size = UD2(w / bw, 0, h / bh, 0)
+			n.w, n.h = w, h
+		end
+		n.bw, n.bh = bw, bh
+	end
+
+	-- Placement of a rectangle w x h turned by `rot` degrees around its center (cx, cy)
+	local function PlaceRotated(n, cx, cy, w, h, rot, bw, bh)
+		local f = n.f
+		if not n.anch then
+			f.AnchorPoint = HALF
+			n.anch = true
+		end
+		if n.x ~= cx or n.y ~= cy or n.bw ~= bw or n.bh ~= bh then
+			f.Position = UD2(cx / bw, 0, cy / bh, 0)
+			n.x, n.y = cx, cy
+		end
+		if n.w ~= w or n.h ~= h or n.bw ~= bw or n.bh ~= bh then
+			f.Size = UD2(w / bw, 0, h / bh, 0)
+			n.w, n.h = w, h
+		end
+		if n.rot ~= rot then
+			f.Rotation = rot
+			n.rot = rot
+		end
+		n.bw, n.bh = bw, bh
+	end
+
+	local function Fill(n, rgb, alpha)
+		local trans = 1 - alpha
+		if n.rgb ~= rgb then
+			n.f.BackgroundColor3 = Color(rgb)
+			n.rgb = rgb
+		end
+		if n.trans ~= trans then
+			n.f.BackgroundTransparency = trans
+			n.trans = trans
+		end
+	end
+
+	local function NoFill(n)
+		if n.trans ~= 1 then
+			n.f.BackgroundTransparency = 1
+			n.trans = 1
+		end
+	end
+
+	local function Corner(n, r)
+		if r <= 0 then
+			if n.cr ~= nil and n.cr ~= 0 then
+				n.corner.CornerRadius = ZERO_UDIM
+				n.cr = 0
+			end
+			return
+		end
+		n.fc = true
+		if n.corner == nil then
+			n.corner = new("UICorner")
+			n.corner.Parent = n.f
+		end
+		if n.cr ~= r then
+			n.corner.CornerRadius = UD(0, r)
+			n.cr = r
+		end
+	end
+
+	local function GradientOff(n)
+		if n.gmode ~= nil then
+			n.gradient.Enabled = false
+			n.gmode = nil
+		end
+	end
+
+	local function GradientBegin(n, mode)
+		n.fg = true
+		local gradient = n.gradient
+		if gradient == nil then
+			gradient = new("UIGradient")
+			gradient.Parent = n.f
+			n.gradient = gradient
+		end
+		if n.gmode ~= mode then
+			if n.gmode == nil then
+				gradient.Enabled = true
+			end
+			n.gmode = mode
+			n.grot, n.gc0, n.ga0, n.gc1, n.ga1 = nil, nil, nil, nil, nil
+			if mode == "mask" then
+				gradient.Color = WHITE_SEQUENCE
+				gradient.Transparency = MASK
+			end
+		end
+		return gradient
+	end
+
+	-- Right triangle mask: the frame shows the part of itself before the middle of a gradient turned by `rot`
+	local function Mask(n, rot)
+		local gradient = GradientBegin(n, "mask")
+		if n.grot ~= rot then
+			gradient.Rotation = rot
+			n.grot = rot
+		end
+	end
+
+	-- Two colors with their opacities along `rot` (0: left to right, 90: top to bottom)
+	local function Linear(n, rot, c0, a0, c1, a1)
+		local gradient = GradientBegin(n, "linear")
+		if n.grot ~= rot then
+			gradient.Rotation = rot
+			n.grot = rot
+		end
+		if n.gc0 ~= c0 or n.gc1 ~= c1 then
+			gradient.Color = ColorSequence.new(Color(c0), Color(c1))
+			n.gc0, n.gc1 = c0, c1
+		end
+		if n.ga0 ~= a0 or n.ga1 ~= a1 then
+			gradient.Transparency = NumberSequence.new(1 - a0, 1 - a1)
+			n.ga0, n.ga1 = a0, a1
+		end
+	end
+
+	---------------------------------------------------------------------------
+	-- Slots, in draw order
+	---------------------------------------------------------------------------
+
+	local slots, used = {}, 0
+
+	local function Take()
+		used += 1
+		local slot = slots[used]
+		if slot == nil then
+			local frame = new("Frame")
+			frame.ZIndex = used
+			frame.Visible = false
+			slot = { root = NewNode(frame), visible = false, clips = false }
+			frame.Parent = gui
+			slots[used] = slot
+		end
+		if not slot.visible then
+			slot.root.f.Visible = true
+			slot.visible = true
+		end
+		return slot
+	end
+
+	-- What an earlier use gave a slot stays until the new use is done and did not ask for it again: a slot that draws the
+	-- same thing every frame writes nothing
+	local function Reset(slot)
+		slot.root.fc, slot.root.fg = false, false
+		slot.fClip, slot.fBody, slot.fLabel = false, false, false
+	end
+
+	local function Finish(slot)
+		local root = slot.root
+		if not root.fc and root.cr ~= nil and root.cr ~= 0 then
+			Corner(root, 0)
+		end
+		if not root.fg then
+			GradientOff(root)
+		end
+		if not slot.fClip and slot.clips then
+			root.f.ClipsDescendants = false
+			slot.clips = false
+		end
+		if not slot.fBody and slot.bodyVisible then
+			slot.body.f.Visible = false
+			slot.bodyVisible = false
+		end
+		if not slot.fLabel and slot.labelVisible then
+			slot.label.Visible = false
+			slot.labelVisible = false
+		end
+	end
+
+	local function Clip(slot)
+		slot.fClip = true
+		if not slot.clips then
+			slot.root.f.ClipsDescendants = true
+			slot.clips = true
+		end
+	end
+
+	local function Body(slot)
+		slot.fBody = true
+		local body = slot.body
+		if body == nil then
+			local frame = new("Frame")
+			frame.Parent = slot.root.f
+			body = NewNode(frame)
+			slot.body = body
+		end
+		if not slot.bodyVisible then
+			body.f.Visible = true
+			slot.bodyVisible = true
+		end
+		return body
+	end
+
+	function backend.BeginFrame()
+		used = 0
+		local size = gui.AbsoluteSize
+		W, H = max(size.X, 1), max(size.Y, 1)
+	end
+
+	function backend.EndFrame()
+		for i = used + 1, #slots do
+			local slot = slots[i]
+			if slot.visible then
+				slot.root.f.Visible = false
+				slot.visible = false
+			end
+		end
+	end
+
+	function backend.Destroy()
+		pcall(function()
+			gui:Destroy()
+		end)
+		tclear(slots)
+		used = 0
+	end
+
+	---------------------------------------------------------------------------
+	-- Primitives
+	---------------------------------------------------------------------------
+
+	function backend.Rect(x0, y0, x1, y1, rgb, alpha)
+		local slot = Take()
+		Reset(slot)
+		local root = slot.root
+		Place(root, x0, y0, x1 - x0, y1 - y0, W, H)
+		Fill(root, rgb, alpha)
+		Finish(slot)
+	end
+
+	-- A rounded rectangle (bx, by, bw, bh, radius r) of which only the part inside the window v and the clip c is shown.
+	-- Without clipping the slot is the shape; with it, the slot is a clipping container holding the shape.
+	local function Shape(bx, by, bw, bh, r, vx0, vy0, vx1, vy1, rgb, alpha, cx0, cy0, cx1, cy1)
+		local x0, y0, x1, y1 = max(vx0, cx0), max(vy0, cy0), min(vx1, cx1), min(vy1, cy1)
+		if x1 <= x0 or y1 <= y0 or alpha <= 0 then
+			return
+		end
+		local slot = Take()
+		Reset(slot)
+		local root = slot.root
+		if x0 == bx and y0 == by and x1 == bx + bw and y1 == by + bh then
+			Place(root, bx, by, bw, bh, W, H)
+			Fill(root, rgb, alpha)
+			Corner(root, r)
+		else
+			local cw, ch = x1 - x0, y1 - y0
+			Place(root, x0, y0, cw, ch, W, H)
+			NoFill(root)
+			Clip(slot)
+			local body = Body(slot)
+			Place(body, bx - x0, by - y0, bw, bh, cw, ch)
+			Fill(body, rgb, alpha)
+			Corner(body, r)
+		end
+		Finish(slot)
+	end
+
+	function backend.Circle(cx, cy, r, rgb, alpha, cx0, cy0, cx1, cy1)
+		Shape(cx - r, cy - r, r * 2, r * 2, r, cx - r, cy - r, cx + r, cy + r, rgb, alpha, cx0, cy0, cx1, cy1)
+		return true
+	end
+
+	function backend.RoundedRect(x0, y0, x1, y1, rtl, rtr, rbr, rbl, rgb, alpha, cx0, cy0, cx1, cy1)
+		local w, h = x1 - x0, y1 - y0
+		if rtl == rtr and rtr == rbr and rbr == rbl then
+			Shape(x0, y0, w, h, rtl, x0, y0, x1, y1, rgb, alpha, cx0, cy0, cx1, cy1)
+			return true
+		end
+		if rtl + rbl > h or rtr + rbr > h or rtl + rtr > w or rbl + rbr > w then
+			return false
+		end
+		-- Different radii: horizontal bands between the corner rows, each as wide as the shape is there, and a quarter
+		-- of a circle for each rounded corner. Nothing overlaps, so translucent colors stay exact.
+		local ys = { y0, y1 }
+		for _, y in { y0 + rtl, y0 + rtr, y1 - rbl, y1 - rbr } do
+			if y > y0 and y < y1 then
+				ys[#ys + 1] = y
+			end
+		end
+		table.sort(ys)
+		for i = 1, #ys - 1 do
+			local ya, yb = ys[i], ys[i + 1]
+			if yb - ya > 1e-4 then
+				local mid = (ya + yb) * 0.5
+				local left = x0 + (if rtl > 0 and mid < y0 + rtl then rtl elseif rbl > 0 and mid > y1 - rbl then rbl else 0)
+				local right = x1 - (if rtr > 0 and mid < y0 + rtr then rtr elseif rbr > 0 and mid > y1 - rbr then rbr else 0)
+				local ax, ay, bx, by = max(left, cx0), max(ya, cy0), min(right, cx1), min(yb, cy1)
+				if bx > ax and by > ay then
+					backend.Rect(ax, ay, bx, by, rgb, alpha)
+				end
+			end
+		end
+		if rtl > 0 then
+			Shape(x0, y0, rtl * 2, rtl * 2, rtl, x0, y0, x0 + rtl, y0 + rtl, rgb, alpha, cx0, cy0, cx1, cy1)
+		end
+		if rtr > 0 then
+			Shape(x1 - rtr * 2, y0, rtr * 2, rtr * 2, rtr, x1 - rtr, y0, x1, y0 + rtr, rgb, alpha, cx0, cy0, cx1, cy1)
+		end
+		if rbr > 0 then
+			Shape(x1 - rbr * 2, y1 - rbr * 2, rbr * 2, rbr * 2, rbr, x1 - rbr, y1 - rbr, x1, y1, rgb, alpha, cx0, cy0, cx1, cy1)
+		end
+		if rbl > 0 then
+			Shape(x0, y1 - rbl * 2, rbl * 2, rbl * 2, rbl, x0, y1 - rbl, x0 + rbl, y1, rgb, alpha, cx0, cy0, cx1, cy1)
+		end
+		return true
+	end
+
+	-- Dear ImGui's gradients (color pickers, alpha bars) change along one axis; other ones become cells
+	function backend.GradientRect(x0, y0, x1, y1, cTL, cTR, cBR, cBL, alphaScale)
+		local rot, ca, cb
+		if cTL == cBL and cTR == cBR then
+			rot, ca, cb = 0, cTL, cTR
+		elseif cTL == cTR and cBL == cBR then
+			rot, ca, cb = 90, cTL, cBL
+		else
+			return false
+		end
+		local slot = Take()
+		Reset(slot)
+		local root = slot.root
+		Place(root, x0, y0, x1 - x0, y1 - y0, W, H)
+		Fill(root, WHITE, 1)
+		Linear(root, rot, band(ca, WHITE), rshift(ca, 24) * alphaScale, band(cb, WHITE), rshift(cb, 24) * alphaScale)
+		Finish(slot)
+		return true
+	end
+
+	-- Half of the rectangle spanned by P->U and P->V: the triangle P, U, V with its right angle at P
+	local function RightTriangle(px, py, ux, uy, vx, vy, rgb, alpha)
+		local a, b = sqrt((ux - px) ^ 2 + (uy - py) ^ 2), sqrt((vx - px) ^ 2 + (vy - py) ^ 2)
+		if a < 0.01 or b < 0.01 then
+			return
+		end
+		if (ux - px) * (vy - py) - (uy - py) * (vx - px) < 0 then
+			ux, uy, vx, vy, a, b = vx, vy, ux, uy, b, a -- the frame's x axis must turn clockwise into its y axis
+		end
+		local slot = Take()
+		Reset(slot)
+		local root = slot.root
+		PlaceRotated(root, (ux + vx) * 0.5, (uy + vy) * 0.5, a, b, deg(atan2(uy - py, ux - px)), W, H)
+		Fill(root, rgb, alpha)
+		Mask(root, deg(atan2(a, b))) -- perpendicular to the hypotenuse, pointing away from the right angle
+		Finish(slot)
+	end
+
+	-- Any triangle is two right triangles: split it along the height onto its longest side
+	local function Triangle(ax, ay, bx, by, cx, cy, rgb, alpha)
+		local abx, aby, bcx, bcy = bx - ax, by - ay, cx - bx, cy - by
+		if abs(abx * bcy - aby * bcx) < 0.02 then
+			return
+		end
+		local ab, bc, ca = abx * abx + aby * aby, bcx * bcx + bcy * bcy, (ax - cx) ^ 2 + (ay - cy) ^ 2
+		local px, py, qx, qy, rx, ry
+		if ab >= bc and ab >= ca then
+			px, py, qx, qy, rx, ry = ax, ay, bx, by, cx, cy
+		elseif bc >= ca then
+			px, py, qx, qy, rx, ry = bx, by, cx, cy, ax, ay
+		else
+			px, py, qx, qy, rx, ry = cx, cy, ax, ay, bx, by
+		end
+		local dx, dy = qx - px, qy - py
+		local length = sqrt(dx * dx + dy * dy)
+		local t = ((rx - px) * dx + (ry - py) * dy) / (length * length)
+		if t * length < 0.05 then
+			RightTriangle(px, py, qx, qy, rx, ry, rgb, alpha)
+		elseif (1 - t) * length < 0.05 then
+			RightTriangle(qx, qy, px, py, rx, ry, rgb, alpha)
+		else
+			local hx, hy = px + dx * t, py + dy * t
+			RightTriangle(hx, hy, px, py, rx, ry, rgb, alpha)
+			RightTriangle(hx, hy, qx, qy, rx, ry, rgb, alpha)
+		end
+	end
+
+	function backend.Polygon(xs, ys, n, rgb, alpha)
+		if n == 4 then
+			-- Strokes (lines, check marks, plots) are rotated rectangles: one frame
+			local abx, aby, bcx, bcy = xs[2] - xs[1], ys[2] - ys[1], xs[3] - xs[2], ys[3] - ys[2]
+			local ab, bc = sqrt(abx * abx + aby * aby), sqrt(bcx * bcx + bcy * bcy)
+			if ab > 0.01 and bc > 0.01 and abs((xs[3] - xs[4]) - abx) < 0.02 and abs((ys[3] - ys[4]) - aby) < 0.02
+				and abs(abx * bcx + aby * bcy) <= 0.005 * ab * bc then
+				local slot = Take()
+				Reset(slot)
+				local root = slot.root
+				PlaceRotated(root, (xs[1] + xs[3]) * 0.5, (ys[1] + ys[3]) * 0.5, ab, bc, deg(atan2(aby, abx)), W, H)
+				Fill(root, rgb, alpha)
+				Finish(slot)
+				return
+			end
+		end
+		for i = 2, n - 1 do
+			Triangle(xs[1], ys[1], xs[i], ys[i], xs[i + 1], ys[i + 1], rgb, alpha)
+		end
+	end
+
+	function backend.Text(x, y, slotFont, size, rgb, alpha, text, width, cx0, cy0, cx1, cy1)
+		size = min(100, max(1, floor(size + 0.5)))
+		local w = max(width, 1)
+		local x0, y0, x1, y1 = max(x, cx0), max(y, cy0), min(x + w, cx1), min(y + size, cy1)
+		if x1 <= x0 or y1 <= y0 then
+			return
+		end
+		local slot = Take()
+		Reset(slot)
+		local root = slot.root
+		local cw, ch = x1 - x0, y1 - y0
+		Place(root, x0, y0, cw, ch, W, H)
+		NoFill(root)
+		if x0 ~= x or y0 ~= y or x1 ~= x + w or y1 ~= y + size then
+			Clip(slot)
+		end
+		local label = slot.label
+		if label == nil then
+			label = new("TextLabel")
+			label.BackgroundTransparency = 1
+			label.BorderSizePixel = 0
+			label.Active = false
+			label.TextXAlignment = Enum.TextXAlignment.Left
+			label.TextYAlignment = Enum.TextYAlignment.Top
+			label.TextWrapped = false
+			label.RichText = false
+			label.TextScaled = false
+			label.AutoLocalize = false
+			label.TextStrokeTransparency = 1
+			label.Parent = root.f
+			slot.label = label
+			slot.lstate = {}
+		end
+		slot.fLabel = true
+		if not slot.labelVisible then
+			label.Visible = true
+			slot.labelVisible = true
+		end
+		local state = slot.lstate
+		-- Placed inside the container, so a clipped text is cut by the container and not moved
+		local lx, ly, lw, lh = x - x0, y - y0, w, size
+		if state.x ~= lx or state.y ~= ly or state.bw ~= cw or state.bh ~= ch then
+			label.Position = UD2(lx / cw, 0, ly / ch, 0)
+			state.x, state.y = lx, ly
+		end
+		if state.w ~= lw or state.h ~= lh or state.bw ~= cw or state.bh ~= ch then
+			label.Size = UD2(lw / cw, 0, lh / ch, 0)
+			state.w, state.h = lw, lh
+		end
+		state.bw, state.bh = cw, ch
+		local font = FontOf(slotFont)
+		if state.font ~= font then
+			label.Font = font
+			state.font = font
+		end
+		if state.size ~= size then
+			label.TextSize = size
+			state.size = size
+		end
+		if state.rgb ~= rgb then
+			label.TextColor3 = Color(rgb)
+			state.rgb = rgb
+		end
+		local trans = 1 - alpha
+		if state.trans ~= trans then
+			label.TextTransparency = trans
+			state.trans = trans
+		end
+		if state.text ~= text then
+			label.Text = text
+			state.text = text
+		end
+		Finish(slot)
 	end
 
 	return backend

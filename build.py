@@ -172,7 +172,7 @@ PIC_LIBRARIES = ["libc++-noexcept", "libc++abi-noexcept", "libc"]
 
 COMMON_TESTS = [
     "api_test", "api_guide_test", "render_modes_test", "init_options_test", "input_test", "shape_detection_test",
-    "measure_test", "text_metrics_test", "shutdown_test",
+    "measure_test", "text_metrics_test", "shutdown_test", "cesium_test", "touch_input_test",
 ]
 DEBUG_TESTS = ["help_section_test", "demo_stress_test"]  # need the demo window
 DOCKING_TESTS = ["docking_test"]

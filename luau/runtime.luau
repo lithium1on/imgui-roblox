@@ -1,6 +1,6 @@
 -- Dear ImGui for Roblox: runtime
 -- Glue between the Luau translation of Dear ImGui (C++ -> WebAssembly with Emscripten -> Luau with Spider),
--- the render modes in renderer.luau (DrawingImmediate, Drawing) and UserInputService.
+-- the render modes in renderer.luau (DrawingImmediate, Drawing, Cesium) and UserInputService.
 -- The bundle calls this chunk with (WasmInstantiate, InstallBindings, Renderer, bundle name).
 
 local WasmInstantiate, InstallBindings, Renderer, BuildName = ...
@@ -606,8 +606,10 @@ end
 local KeyByName = {}
 local ModKeys = {}
 
-local function CreateUserInput(options)
+-- hitTest(x, y): whether a touch landing at x, y is on a Dear ImGui window (true / false), or nil when that cannot be told
+local function CreateUserInput(options, hitTest)
 	local UIS = game:GetService("UserInputService")
+	local GuiService = game:GetService("GuiService")
 	local KeyCode = Enum.KeyCode
 	local UserInputType = Enum.UserInputType
 	local blockInput = options.BlockGameInput ~= false
@@ -617,6 +619,49 @@ local function CreateUserInput(options)
 	local textBox = nil
 	local captureRetryAt = 0
 	local pasteKeyAt, pasteText, pasteTextAt = nil, nil, 0
+
+	-- Touch. The first finger is the mouse: it hovers, presses and drags. A second finger turns both into scrolling, and
+	-- holding one finger still is a right click. Dear ImGui forgets the hover when the finger lifts (a position far off
+	-- screen), as it does for a touch screen.
+	local NO_MOUSE = -1000000
+	local touchOffset = options.TouchOffset or Vector2.new(0, 0)
+	local longPress = options.TouchLongPress
+	if longPress == nil then
+		longPress = 0.6
+	elseif longPress == false then
+		longPress = nil
+	end
+	local scrollUnit = 5 * (options.FontSize or 13) / (options.TouchScrollSpeed or 1) -- pixels per wheel notch (5 lines)
+	local touches, touchCount, primary = {}, 0, nil
+	local sunkTouches = {}
+	local lastX, lastY = nil, nil -- the last mouse position sent
+	local scrolling, scrollX, scrollY = false, 0, 0
+	local usingTouch, keyboardDismissed = false, false
+	local touchKeyboard = options.TouchKeyboard
+	if touchKeyboard == nil then
+		touchKeyboard = UIS.TouchEnabled and not UIS.KeyboardEnabled -- a soft keyboard: Backspace and Enter arrive as text
+	end
+	local SENTINEL = "\u{200B}"
+
+	-- InputObject.Position leaves out the top bar (GetMouseLocation, which the mouse uses, does not)
+	local function touchPoint(input)
+		local position = input.Position
+		local ok, inset = pcall(GuiService.GetGuiInset, GuiService)
+		if not ok or inset == nil then
+			inset = Vector2.new(0, 0)
+		end
+		return position.X + inset.X + touchOffset.X, position.Y + inset.Y + touchOffset.Y
+	end
+
+	local function touchCenter()
+		local sx, sy, n = 0, 0, 0
+		for _, record in touches do
+			sx += record.x
+			sy += record.y
+			n += 1
+		end
+		return sx / math.max(n, 1), sy / math.max(n, 1)
+	end
 
 	local function push(kind, a, b)
 		events[#events + 1] = { kind, a, b }
@@ -666,7 +711,38 @@ local function CreateUserInput(options)
 
 	connections[#connections + 1] = UIS.InputBegan:Connect(function(input)
 		local inputType = input.UserInputType
-		if inputType == UserInputType.MouseButton1 then
+		if inputType == UserInputType.Touch then
+			usingTouch, keyboardDismissed = true, false
+			local x, y = touchPoint(input)
+			local hit = sunkTouches[input]
+			if hit == nil then
+				hit = hitTest(x, y)
+			end
+			local record = { x = x, y = y, startX = x, startY = y, startedAt = clock(), moved = false, ignored = hit == false }
+			touches[input] = record
+			if record.ignored then
+				return -- the game's touch (the thumbstick, the camera): only a quick tap reaches Dear ImGui, when it lifts
+			end
+			touchCount += 1
+			if touchCount == 1 then
+				primary = record
+				push("pos", x, y)
+				push("button", 0, true)
+			else
+				if primary ~= nil and not primary.cancelled then
+					primary.cancelled = true -- the first finger was the start of a scroll, not a click
+					push("pos", NO_MOUSE, NO_MOUSE)
+					push("button", 0, false)
+				end
+				record.cancelled = true
+				scrolling = true
+				scrollX, scrollY = touchCenter()
+				push("pos", scrollX, scrollY)
+			end
+		elseif inputType == UserInputType.MouseButton1 then
+			if usingTouch then
+				usingTouch, lastX, lastY = false, nil, nil
+			end
 			push("button", 0, true)
 		elseif inputType == UserInputType.MouseButton2 then
 			push("button", 1, true)
@@ -692,7 +768,41 @@ local function CreateUserInput(options)
 	end)
 	connections[#connections + 1] = UIS.InputEnded:Connect(function(input)
 		local inputType = input.UserInputType
-		if inputType == UserInputType.MouseButton1 then
+		if inputType == UserInputType.Touch then
+			local record = touches[input]
+			touches[input] = nil
+			sunkTouches[input] = nil
+			if record == nil then
+				return
+			end
+			if record.ignored then
+				-- A tap off the windows still clicks, so popups close and fields lose focus; dragging the camera does not
+				if not record.moved and touchCount == 0 and clock() - record.startedAt < 0.4 then
+					push("pos", record.x, record.y)
+					push("button", 0, true)
+					push("button", 0, false)
+					push("pos", NO_MOUSE, NO_MOUSE)
+				end
+				return
+			end
+			touchCount -= 1
+			if record == primary then
+				primary = nil
+				if not record.cancelled then
+					push("pos", record.x, record.y)
+					push("button", 0, false)
+				end
+			end
+			if scrolling and touchCount < 2 then
+				scrolling = false
+				for _, other in touches do
+					other.cancelled = true -- a finger left over from a scroll does nothing
+				end
+			end
+			if touchCount == 0 then
+				push("pos", NO_MOUSE, NO_MOUSE)
+			end
+		elseif inputType == UserInputType.MouseButton1 then
 			push("button", 0, false)
 		elseif inputType == UserInputType.MouseButton2 then
 			push("button", 1, false)
@@ -706,6 +816,31 @@ local function CreateUserInput(options)
 		end
 	end)
 	connections[#connections + 1] = UIS.InputChanged:Connect(function(input)
+		local inputType = input.UserInputType
+		if inputType == UserInputType.Touch then
+			local record = touches[input]
+			if record == nil then
+				return
+			end
+			record.x, record.y = touchPoint(input)
+			if not record.moved and (record.x - record.startX) ^ 2 + (record.y - record.startY) ^ 2 > 100 then
+				record.moved = true
+			end
+			if record.ignored then
+				return
+			end
+			if scrolling then
+				local cx, cy = touchCenter()
+				push("pos", cx, cy)
+				push("wheel", (cx - scrollX) / scrollUnit, (cy - scrollY) / scrollUnit)
+				scrollX, scrollY = cx, cy
+			elseif record == primary and not record.cancelled then
+				push("pos", record.x, record.y)
+			end
+			return
+		elseif inputType == UserInputType.MouseMovement and usingTouch then
+			usingTouch, lastX, lastY = false, nil, nil
+		end
 		if input.UserInputType == UserInputType.MouseWheel then
 			push("wheel", 0, input.Position.Z)
 		end
@@ -732,7 +867,7 @@ local function CreateUserInput(options)
 		textBox.Name = "TextInput"
 		textBox.BackgroundTransparency = 1
 		textBox.TextTransparency = 1
-		textBox.Text = ""
+		textBox.Text = if touchKeyboard then SENTINEL else ""
 		textBox.ClearTextOnFocus = false
 		textBox.MultiLine = true
 		textBox.Size = UDim2.fromOffset(1, 1)
@@ -800,7 +935,42 @@ local function CreateUserInput(options)
 		local clearing = false
 		connections[#connections + 1] = textBox:GetPropertyChangedSignal("Text"):Connect(function()
 			local text = textBox.Text
-			if clearing or text == "" then
+			if clearing then
+				return
+			end
+			if touchKeyboard then
+				-- A soft keyboard sends no key events: the TextBox keeps one invisible character, so deleting it is Backspace,
+				-- and a line break is Enter. Whatever follows the character is typed text.
+				if text == SENTINEL then
+					return
+				end
+				clearing = true
+				textBox.Text = SENTINEL
+				pcall(function()
+					textBox.CursorPosition = #SENTINEL + 1
+				end)
+				clearing = false
+				if text == "" then
+					push("key", KeyCode.Backspace, true)
+					push("key", KeyCode.Backspace, false)
+					return
+				end
+				if string.sub(text, 1, #SENTINEL) == SENTINEL then
+					text = string.sub(text, #SENTINEL + 1)
+				end
+				pcall(function()
+					for _, codepoint in utf8.codes(text) do
+						if codepoint == 10 or codepoint == 13 then
+							push("key", KeyCode.Return, true)
+							push("key", KeyCode.Return, false)
+						elseif codepoint >= 32 and codepoint ~= 127 then
+							push("char", codepoint)
+						end
+					end
+				end)
+				return
+			end
+			if text == "" then
 				return
 			end
 			clearing = true
@@ -821,11 +991,42 @@ local function CreateUserInput(options)
 		end)
 	end
 
+	if textBox ~= nil and touchKeyboard then
+		-- Closing the soft keyboard ends the typing; it comes back with the next tap, not on its own
+		connections[#connections + 1] = textBox.FocusLost:Connect(function(enterPressed)
+			keyboardDismissed = true
+			if enterPressed then
+				push("key", KeyCode.Return, true)
+				push("key", KeyCode.Return, false)
+			end
+		end)
+	end
+
 	local CAS = game:GetService("ContextActionService")
 	local keyboardSunk = false
+
+	-- A touch that lands on a window is kept from the game (camera, thumbstick) for as long as it lasts. The mouse is held
+	-- back by the sink GUI once Dear ImGui hovers a window, but a finger has no hover before it lands: ask where the
+	-- windows are, and decide on the spot. Without that answer, a touch is kept away once Dear ImGui wants the mouse.
+	if blockInput then
+		pcall(function()
+			CAS:BindActionAtPriority("DearImGuiTouchSink", function(_, state, input)
+				if state == Enum.UserInputState.Begin then
+					local x, y = touchPoint(input)
+					local hit = hitTest(x, y)
+					sunkTouches[input] = hit
+					return if hit == true then Enum.ContextActionResult.Sink else Enum.ContextActionResult.Pass
+				end
+				local sunk = sunkTouches[input]
+				if state == Enum.UserInputState.End or state == Enum.UserInputState.Cancel then
+					sunkTouches[input] = nil
+				end
+				return if sunk == true then Enum.ContextActionResult.Sink else Enum.ContextActionResult.Pass
+			end, false, 3000, Enum.UserInputType.Touch)
+		end)
+	end
 	local sinkKeys = nil
 
-	local lastX, lastY = nil, nil
 	local modState = { false, false, false, false }
 	local modPairs = {
 		{ KeyCode.LeftControl, KeyCode.RightControl },
@@ -850,6 +1051,8 @@ local function CreateUserInput(options)
 				local kind = event[1]
 				if kind == "button" then
 					Raw.AddMouseButtonEvent(event[2], event[3])
+				elseif kind == "pos" then
+					Raw.AddMousePosEvent(event[2], event[3])
 				elseif kind == "key" then
 					local imguiName = ImGuiKeyFor(event[2])
 					if imguiName then
@@ -884,10 +1087,23 @@ local function CreateUserInput(options)
 				pasteKeyAt, pasteText = nil, nil
 			end
 		end
-		local mouse = UIS:GetMouseLocation()
-		if mouse.X ~= lastX or mouse.Y ~= lastY then
-			lastX, lastY = mouse.X, mouse.Y
-			Raw.AddMousePosEvent(lastX, lastY)
+		if not usingTouch then
+			local mouse = UIS:GetMouseLocation()
+			if mouse.X ~= lastX or mouse.Y ~= lastY then
+				lastX, lastY = mouse.X, mouse.Y
+				Raw.AddMousePosEvent(lastX, lastY)
+			end
+		elseif longPress ~= nil and primary ~= nil and not primary.cancelled and not primary.moved and not scrolling
+			and clock() - primary.startedAt >= longPress then
+			-- Holding a finger still is a right click: let go of the left button off screen, so nothing is clicked
+			local x, y = primary.x, primary.y
+			primary.cancelled = true
+			Raw.AddMousePosEvent(NO_MOUSE, NO_MOUSE)
+			Raw.AddMouseButtonEvent(0, false)
+			Raw.AddMousePosEvent(x, y)
+			Raw.AddMouseButtonEvent(1, true)
+			Raw.AddMouseButtonEvent(1, false)
+			Raw.AddMousePosEvent(NO_MOUSE, NO_MOUSE)
 		end
 		if repeatKey then
 			if typing() or not UIS:IsKeyDown(repeatKey) then
@@ -921,7 +1137,7 @@ local function CreateUserInput(options)
 			if band(state, 4) ~= 0 then
 				-- A click releases the TextBox, so take focus back while the text field stays active, unless the player
 				-- moved to another TextBox (chat or the game's own)
-				if not textBox:IsFocused() and UIS:GetFocusedTextBox() == nil and clock() >= captureRetryAt then
+				if not keyboardDismissed and not textBox:IsFocused() and UIS:GetFocusedTextBox() == nil and clock() >= captureRetryAt then
 					pcall(textBox.CaptureFocus, textBox)
 					if not textBox:IsFocused() then
 						captureRetryAt = clock() + 0.5
@@ -964,6 +1180,11 @@ local function CreateUserInput(options)
 	local function cleanup()
 		for _, connection in connections do
 			connection:Disconnect()
+		end
+		if blockInput then
+			pcall(function()
+				CAS:UnbindAction("DearImGuiTouchSink")
+			end)
 		end
 		if keyboardSunk then
 			pcall(function()
@@ -1054,6 +1275,9 @@ local function AllocateFontSlot(font)
 	error("[ImGui] at most 8 different fonts can be used at once", 3)
 end
 
+local CesiumParent = nil -- where ImGui.Cesium.Parent says the ScreenGui goes; nil picks gethui(), CoreGui or PlayerGui
+
+-- (Instance below is Roblox's: this bundle's own Instance table is declared further down)
 local function ResolveRenderMode(options)
 	local mode = Renderer.NormalizeMode(options.RenderMode)
 	if mode ~= "Auto" then
@@ -1066,6 +1290,8 @@ local function ResolveRenderMode(options)
 		return "DrawingImmediate"
 	elseif options.Drawing ~= nil or (Drawing ~= nil and Drawing.new ~= nil) then
 		return "Drawing"
+	elseif game ~= nil and Instance ~= nil and Instance.new ~= nil then
+		return Renderer.InstanceMode -- Studio, or an executor without a Drawing library: Roblox UI instances
 	end
 	error("[ImGui] no render mode is available here; pass RenderMode together with a DrawingImmediate or Drawing library", 3)
 end
@@ -1088,6 +1314,8 @@ local function CreateBackend(mode, options)
 			error('[ImGui] RenderMode "Drawing" needs the Drawing library (Drawing.new)', 3)
 		end
 		return Renderer.Drawing(lib, FontSlots, options), nil
+	elseif mode == Renderer.InstanceMode then
+		return Renderer.Cesium(FontSlots, options, CesiumParent), nil
 	end
 	if type(options.Renderer) ~= "table" then
 		error("[ImGui] options.Renderer must be a table implementing Rect, Polygon and Text", 3)
@@ -1150,6 +1378,7 @@ local function StartContext(options)
 
 		local keyBegin = F.rbx_key_named_begin[1](F.rbx_key_named_begin)
 		local keyEnd = F.rbx_key_named_end[1](F.rbx_key_named_end)
+		F.rbx_hit_test = Exports.rbx_hit_test -- optional: bundles built before it was added work without it
 		for key = keyBegin, keyEnd - 1 do
 			local name = ReadCString(Mem(), (F.rbx_key_name[1](F.rbx_key_name, key)))
 			if name then
@@ -1176,7 +1405,16 @@ local function StartContext(options)
 		Backend, RenderMode = backend, mode
 		RenderDrawData = Renderer.CreateWalker(backend, measureGlyph, options, textMetrics)
 		if options.Input ~= false and game ~= nil then
-			InputPump, InputPost, InputCleanup = CreateUserInput(options)
+			InputPump, InputPost, InputCleanup = CreateUserInput(options, function(x, y)
+				if options.HitTest ~= nil then
+					return options.HitTest(x, y) == true
+				end
+				local hitTest = F.rbx_hit_test
+				if hitTest == nil then
+					return nil
+				end
+				return (hitTest[1](hitTest, x, y)) ~= 0
+			end)
 		end
 	end)
 	if not ok then
@@ -1530,6 +1768,17 @@ function Instance.RenderMode()
 	return RenderMode
 end
 
+-- The ScreenGui of the Cesium mode, and where it goes (nil in the other modes)
+function Instance.CesiumGui()
+	return if Backend ~= nil and Backend.GetScreenGui ~= nil then Backend.GetScreenGui() else nil
+end
+
+function Instance.SetCesiumParent(parent)
+	if Backend ~= nil and Backend.SetParent ~= nil then
+		Backend.SetParent(parent)
+	end
+end
+
 function Instance.Generation()
 	return Generation
 end
@@ -1784,6 +2033,9 @@ function ScriptFunctions.Init(options)
 		BindScript(Script, Instance)
 	end
 	Script.Shared = Script.Instance ~= Instance or Group ~= nil
+	if CesiumParent ~= nil and Script.Instance ~= Instance then
+		Script.Instance.SetCesiumParent(CesiumParent)
+	end
 	ImGui.InitTime = clock() - startTime
 	return ImGui
 end
@@ -1977,6 +2229,36 @@ function Step(deltaTime, displayWidth, displayHeight)
 	stats.Draw = t5 - t4
 	stats.Total = clock() - t0
 end
+
+-- ImGui.Cesium: settings of the Cesium render mode (Roblox UI instances), kept apart from Init's options.
+--   ImGui.Cesium.Parent = gethui()   where the ScreenGui lives; before or after Init, nil picks gethui(), CoreGui or PlayerGui
+--   ImGui.Cesium.ScreenGui           the ScreenGui while the mode runs (read only)
+-- A script that joins another script's context moves that context's ScreenGui too.
+ScriptFunctions[Renderer.InstanceMode] = setmetatable({}, {
+	__index = function(_, key)
+		local instance = Script.Instance
+		local gui = if instance ~= nil and not Script.Leaving then instance.CesiumGui() else nil
+		if key == "Parent" then
+			return if gui ~= nil then gui.Parent else CesiumParent
+		elseif key == "ScreenGui" then
+			return gui
+		end
+		return nil
+	end,
+	__newindex = function(_, key, value)
+		if key ~= "Parent" then
+			error("[ImGui] ImGui." .. Renderer.InstanceMode .. "." .. tostring(key) .. " cannot be set (only Parent can)", 2)
+		end
+		if value ~= nil and type(value) ~= "userdata" and type(value) ~= "table" then
+			error("[ImGui] ImGui." .. Renderer.InstanceMode .. ".Parent must be an Instance", 2)
+		end
+		CesiumParent = value
+		local instance = Script.Instance
+		if instance ~= nil and not Script.Leaving then
+			instance.SetCesiumParent(value)
+		end
+	end,
+})
 
 -- Seconds spent in each part of the last frame: Input, NewFrame, Callbacks (the scripts' UI code),
 -- Render (ImGui::Render + draw table), Draw (render mode calls) and Total.

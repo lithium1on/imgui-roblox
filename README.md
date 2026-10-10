@@ -3,7 +3,7 @@
 # Dear ImGui for Roblox
 
 The real [Dear ImGui](https://github.com/ocornut/imgui) v1.92.9b, compiled to Luau, for Roblox executors.<br>
-Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** library.
+Drawn with Potassium's **DrawingImmediate**, any executor's **Drawing** library, or real Roblox UI (**Cesium**, which also runs in Studio).
 
 **[Download](../../releases/latest)** · **[Wiki](../../wiki)** · **[Getting started](../../wiki/Getting-Started)** · **[API guide](../../wiki/Luau-API-Guide)**
 
@@ -15,7 +15,7 @@ Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** librar
 
 | Values | Meaning |
 |---|---|
-| **Compatibility** | Runs on Potassium's DrawingImmediate and on any executor with a Drawing library, detected automatically, with any keyboard layout. |
+| **Compatibility** | Runs on Potassium's DrawingImmediate, on any executor with a Drawing library and, as Roblox UI instances, in Studio and anywhere else; detected automatically, with any keyboard layout, with a mouse or a finger. |
 | **Stability** | Unmodified Dear ImGui, and every bundle, addon and example goes through the headless tests before a release. |
 | **Size** | One file per build, from 3.2 MB; addons such as the IDE are separate files, loaded only by the scripts that use them. |
 | **Parity** | Dear ImGui's API from Luau under its C++ names, generated from Dear ImGui's own metadata, docking branch included. |
@@ -28,9 +28,15 @@ Drawn with Potassium's **DrawingImmediate** or any executor's **Drawing** librar
   [Spider](https://github.com/SovereignSatellite/Spider).
 - **The whole API from Luau**: 454 functions generated from [dear_bindings](https://github.com/dearimgui/dear_bindings)
   metadata, named like the C++ API. Out parameters come back as return values; draw lists, style and IO are handles.
-- **Two render modes, detected automatically**: DrawingImmediate (Potassium) and the Drawing library (other executors).
+- **Three render modes, detected automatically**: DrawingImmediate (Potassium), the Drawing library (other executors) and
+  **Cesium**, which draws with Roblox UI instances (`Frame`, `TextLabel`, `UICorner`, `UIGradient`) in a `ScreenGui`. Cesium is
+  the fallback where there is no Drawing library, such as Studio, and can be chosen with `RenderMode = "Cesium"`. Put its
+  ScreenGui somewhere with `ImGui.Cesium.Parent = gethui()` (before or after `Init`; without it: `gethui()`, `CoreGui`, then `PlayerGui`).
 - **Real input**: mouse, wheel, keyboard layouts (AZERTY, AltGr, accents), Ctrl+V paste. Clicks and keys don't reach
   the game while you use a window.
+- **Touch, in every render mode**: a finger is the mouse (hover, press, drag), two fingers scroll, holding one still is a
+  right click, and the on-screen keyboard types, deletes and confirms. A touch that lands on a window never reaches the
+  game's camera or thumbstick. Options: `TouchLongPress` (seconds, or `false`), `TouchScrollSpeed`, `TouchKeyboard`, `TouchOffset`.
 - **Text measured with the executor's own fonts**, checked against drawn text at runtime so wrapping stays inside windows.
 - **Docking**: `docking.luau` is built from Dear ImGui's docking branch, so windows dock into each other and into
   dockspaces.
@@ -70,6 +76,13 @@ ImGui.OnFrame(function()
 	end
 	ImGui.End()
 end)
+```
+
+Roblox UI instead of Drawing (Studio, or an executor without a Drawing library):
+
+```lua
+ImGui.Cesium.Parent = gethui() -- optional; set it before or after Init
+ImGui.Init({ RenderMode = "Cesium", Font = "Monospace", FontSize = 14 })
 ```
 
 With the IDE addon:
